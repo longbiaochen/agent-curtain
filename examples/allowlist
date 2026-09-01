@@ -1,0 +1,9 @@
+# screen-guard 白名单 —— 这些进程的输入会被放行。
+# 按可执行文件路径匹配(pgrep -f),因此进程重启换了 PID 也依然有效。
+# 每行一条,# 开头为注释。
+#
+# 依据:实测 UURemote 的输入经过 HID 层且带自身 PID
+# (pid=58218 UURemoteServer,679/679 事件归属明确),故可精确放行。
+# agent 的合成事件走 session 层、不经过 HID 层,无需列在这里。
+
+/Applications/UURemote.app/Contents/Helpers/UURemoteServer

@@ -1,0 +1,148 @@
+#!/bin/zsh
+# curtain —— 「幕帘模式」:熄灭所有屏幕并阻断物理键鼠,但保持会话解锁,
+#                  让 GUI agent 继续工作,同时放行白名单内的远程运维工具。
+#
+# ── 安全取舍(请先读这段)──────────────────────────────────────────
+# 本工具的安全强度**低于真锁屏**。会话是解锁的,能绕过输入阻断的人
+# (插一个新键盘、直接重启、拔掉显示器接别的)即可进入桌面。
+# 人不在且没有 GUI agent 任务时,真锁屏仍是更稳妥的选择。
+# 它换来的是:GUI agent 可用 —— 这是真锁屏做不到的(Codex Locked use
+# 因插件冷启动竞态不可靠,Claude Computer Use 官方不支持锁屏)。
+#
+# ── 实测依据(2026-09-01)──────────────────────────────────────────
+# · 物理输入走 kCGHIDEventTap;agent 的 CGEvent.post(.cgSessionEventTap)
+#   不经过该层。对照:基线 session=2 / 阻断中 session=1
+# · UURemote 经 HID 层但带自身 PID(679/679 归属明确),故可按 PID 精确放行
+# · BetterDisplay 亮度归零不影响画面捕获:截图 240.7 vs 基线 241.2
+# · pmset displaysleepnow 会让截图变 0.0 或直接失败 —— 绝不可用于此目的
+# · m1ddc 对内置屏和 DELL U3219Q 写不进去,故改用 BetterDisplay
+# · 显示器必须用 -displayID 定址:name 字段两块小米重名,
+#   originalName 对内置屏(Color LCD)匹配不上
+#
+# ── 用法 ────────────────────────────────────────────────────────
+#   curtain on [秒]   默认无自动解除;传秒数则到点自动解除
+#   curtain off
+#   curtain status
+#   curtain allow     编辑白名单
+#
+# ── 解除方式(四重,任一即可)────────────────────────────────────
+#   热键  Ctrl+Opt+Cmd+Shift+U   阻断器在吞事件之前识别它
+#   本地  curtain off
+#   远程  ssh <host> curtain off
+#   超时  仅在显式传入秒数时生效(默认无)
+set -u
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+
+BLOCKER=$HOME/.local/libexec/hid-blocker
+BANNER=$HOME/.local/libexec/curtain-banner
+CONF=$HOME/.config/curtain/allowlist
+STATE=$HOME/.local/state/curtain
+PIDF=$STATE/blocker.pid
+LOG=$STATE/blocker.log
+LUMF=$STATE/brightness.bak
+BANPID=$STATE/banner.pid
+BD=betterdisplaycli
+mkdir -p $STATE
+
+running() { [[ -f $PIDF ]] && kill -0 $(<$PIDF) 2>/dev/null }
+
+# 用 displayID 定址 —— 唯一且稳定
+display_ids() {
+  timeout 15 $BD get --identifiers 2>/dev/null | python3 -c "
+import sys,json
+try: objs=json.loads('['+sys.stdin.read().strip()+']')
+except Exception: sys.exit(0)
+for o in objs:
+    i=o.get('displayID')
+    if i: print(i)
+" 2>/dev/null
+}
+dim() {
+  : > $LUMF
+  for i in ${(f)"$(display_ids)"}; do
+    cur=$(timeout 10 $BD get -displayID=$i -brightness 2>/dev/null | tr -d '\n')
+    [[ "$cur" == <->* || "$cur" == 0.* || "$cur" == 1.* ]] || continue
+    print -r -- "$i $cur" >> $LUMF
+    timeout 10 $BD set -displayID=$i -brightness=0 >/dev/null 2>&1
+  done
+}
+undim() {
+  [[ -f $LUMF ]] || return 0
+  while read -r i v; do
+    [[ -n "$i" && -n "$v" ]] && timeout 10 $BD set -displayID=$i -brightness=$v >/dev/null 2>&1
+  done < $LUMF
+  rm -f $LUMF
+}
+
+case "${1:-status}" in
+  on)
+    # 默认无限期 —— 幕帘只应由人主动拉开,不该自己消失。
+    # 底层阻断器需要一个秒数,故用 10 年近似无限期。
+    secs=${2:-315360000}
+    running && { print "已在生效中 (pid $(<$PIDF))"; exit 0 }
+    allow=()
+    [[ -f $CONF ]] && allow=(${(f)"$(grep -vE '^\s*(#|$)' $CONF)"})
+    dim
+    $BLOCKER $secs $allow > $LOG 2>&1 &
+    bpid=$!
+    print $bpid > $PIDF
+    # 看门狗:阻断器无论因超时、热键、SIGTERM 还是崩溃退出,都恢复亮度。
+    # 修复缺陷:此前只有 `off` 会 undim,自动解除会把屏幕永远留在全黑。
+    ( while kill -0 $bpid 2>/dev/null; do sleep 2; done
+      [[ -f $LUMF ]] && while read -r i v; do
+        [[ -n "$i" && -n "$v" ]] && timeout 10 betterdisplaycli set -displayID=$i -brightness=$v >/dev/null 2>&1
+      done < $LUMF
+      [[ -f $BANPID ]] && { kill -TERM $(<$BANPID) 2>/dev/null; rm -f $BANPID }
+      osascript -e 'display notification "已自动解除" with title "curtain"' >/dev/null 2>&1
+      rm -f $LUMF $PIDF ) >/dev/null 2>&1 &
+    sleep 1
+    if ! running; then
+      print "启动失败:"; sed 's/^/  /' $LOG; undim; rm -f $PIDF; exit 1
+    fi
+    # 屏幕提示条:现场看不到(面板全黑),UURemote 能看到
+    $BANNER >/dev/null 2>&1 &
+    print $! > $BANPID
+    osascript -e 'display notification "物理键鼠已阻断 · Ctrl+Opt+Cmd+Shift+U 解除" with title "curtain 已启用"' >/dev/null 2>&1
+    sed 's/^/  /' $LOG
+    if (( secs > 100000000 )); then
+      print "已生效。白名单 ${#allow} 项,无自动解除 —— 必须主动拉开。"
+    else
+      print "已生效。白名单 ${#allow} 项,${secs} 秒后自动解除。"
+    fi
+    print "拉开方式(off 不需要辅助功能权限,任何终端都能执行):"
+    print "  · UURemote → 终端 → curtain off      ← 主备用路径,已实测"
+    print "  · ssh <host> curtain off             ← 已实测"
+    print "  · 热键 Ctrl+Opt+Cmd+Shift+U          ← 需真实按键,未验证"
+    ;;
+  off)
+    if running; then kill -TERM $(<$PIDF) 2>/dev/null; sleep 2; fi
+    rm -f $PIDF
+    [[ -f $BANPID ]] && { kill -TERM $(<$BANPID) 2>/dev/null; rm -f $BANPID }
+    osascript -e 'display notification "已恢复正常" with title "curtain 已解除"' >/dev/null 2>&1
+    undim
+    tail -1 $LOG 2>/dev/null | sed 's/^/  /'
+    print "已解除,亮度已恢复。"
+    ;;
+  status)
+    if running; then print "阻断: 生效中 (pid $(<$PIDF))"; head -1 $LOG | sed 's/^/  /'
+    else print "阻断: 未生效"; fi
+    print -n "锁屏: "
+    python3 -c "
+import subprocess,plistlib
+o=subprocess.run(['ioreg','-n','Root','-d1','-a'],capture_output=True).stdout
+d=plistlib.loads(o); r=d[0] if isinstance(d,list) else d
+print(r.get('IOConsoleUsers',[{}])[0].get('CGSSessionScreenIsLocked','False'))
+" 2>/dev/null || print "?"
+    if [[ -f $BANPID ]] && kill -0 $(<$BANPID) 2>/dev/null; then print "提示条: 显示中"; else print "提示条: 未显示"; fi
+    print "白名单:"
+    [[ -f $CONF ]] && grep -vE '^\s*(#|$)' $CONF | while read -r p; do
+      print "  [$(pgrep -f "$p" 2>/dev/null | wc -l | tr -d ' ') 个进程] $p"
+    done
+    print "显示器:"
+    for i in ${(f)"$(display_ids)"}; do
+      print "  displayID=$i brightness=$(timeout 10 $BD get -displayID=$i -brightness 2>/dev/null | tr -d '\n')"
+    done
+    ;;
+  allow) ${EDITOR:-vi} $CONF ;;
+  *) print "用法: curtain {on [秒]|off|status|allow}" >&2; exit 2 ;;
+esac

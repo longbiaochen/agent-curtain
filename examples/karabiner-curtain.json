@@ -1,0 +1,53 @@
+{
+  "title": "agent-curtain",
+  "rules": [
+    {
+      "description": "curtain: 拉上幕帘 (Ctrl+Opt+Cmd+Shift+L)",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "l",
+            "modifiers": {
+              "mandatory": [
+                "control",
+                "option",
+                "command",
+                "shift"
+              ]
+            }
+          },
+          "to": [
+            {
+              "shell_command": "/usr/local/bin/curtain on >> ~/.local/state/curtain/hotkey.log 2>&1"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "description": "curtain: 拉开幕帘 (Ctrl+Opt+Cmd+Shift+U)",
+      "manipulators": [
+        {
+          "type": "basic",
+          "from": {
+            "key_code": "u",
+            "modifiers": {
+              "mandatory": [
+                "control",
+                "option",
+                "command",
+                "shift"
+              ]
+            }
+          },
+          "to": [
+            {
+              "shell_command": "/usr/local/bin/curtain off >> ~/.local/state/curtain/hotkey.log 2>&1"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
