@@ -7,8 +7,11 @@ macOS 上的「假锁屏」:熄灭全部显示器、阻断物理键鼠,但**保�
 
 ```
 curtain on      # 四块屏全黑,物理键鼠失效,agent 照常
+curtain on 300  # 5 分钟后自动解除
+curtain on --allow-any-injected  # 放行软件注入，但仍应用拒绝名单
 curtain off     # 拉开
 curtain status
+curtain doctor
 ```
 
 ## 解决什么问题
@@ -56,15 +59,20 @@ cd agent-curtain && ./install.sh
 - [BetterDisplay](https://betterdisplay.pro/) —— 调光后端,`brew install --cask betterdisplay`
 - (可选)Karabiner-Elements —— 热键宿主
 
-安装后**必须**给 `~/.local/libexec/hid-blocker` 授予辅助功能权限:
+安装脚本会优先使用本机的 `Developer ID Application` 身份，并启用 Hardened
+Runtime 与安全时间戳。安装后**必须**给 `~/.local/libexec/hid-blocker`
+授予一次辅助功能权限:
 系统设置 → 隐私与安全性 → 辅助功能 → 添加该二进制。
 
-> TCC 授权绑定代码签名哈希,**重新编译后需要重新授权**。
+> 没有 Developer ID 时会退回 ad-hoc 签名；这种情况下重新编译后需要重新授权。
 > 旧授权行仍会留在 TCC.db 里,看起来像已授权 —— 这是个很容易误判的坑。
+
+安装后运行 `curtain doctor`，确认依赖、三项安装产物、拒绝名单和显示器发现均通过。
 
 ## 白名单
 
-`~/.config/curtain/allowlist`,每行一个可执行文件路径。按路径匹配、
+`~/.config/curtain/allowlist`,每行一个可执行文件路径。阻断器通过
+`proc_listallpids` + `proc_pidpath` 读取真实可执行文件路径并精确匹配，
 每 3 秒刷新 PID,因此进程重启换了 PID 依然有效。
 
 ```
@@ -92,7 +100,8 @@ curtain on --allow-any-injected
 HID 设备重发事件。若重发事件带非零 PID,「放行一切 `pid != 0`」会把物理键盘
 整体放行,阻断器失效。
 
-默认拒绝名单包含 Karabiner 的三个组件。这个设计的好处是**不依赖对未知行为的
+安装脚本默认写入包含 Karabiner 三个组件的拒绝名单。这个设计的好处是
+**不依赖对未知行为的
 判断**:若重发事件带 PID,拒绝名单堵住它;若它们其实是 `pid=0`(DriverKit
 设备的常见行为),拒绝名单是无害的空操作。**两种情况下都安全。**
 
@@ -113,6 +122,10 @@ curtain status   # 查看解析到的进程数
 `curtain on` 需要辅助功能权限,且**仅授权二进制还不够** —— 从 ssh 直接 fork 时
 TCC 责任进程是 `sshd`,会压过它。`curtain` 内部因此用 `launchctl submit` 启动
 阻断器,归责回到二进制本身。实测 ssh 远程 `on`/`off` 往返均可用。
+
+阻断器、远程提示条和亮度恢复看门狗分别由 launchd 托管。看门狗以阻断器 PID
+为真相源；阻断器因超时、热键、SIGTERM 或崩溃退出后都会恢复亮度并关闭提示条，
+不依赖发起 `curtain on` 的 SSH shell 继续存活。
 
 **`curtain off` 不需要任何权限** —— 它只是发 SIGTERM 加恢复亮度。
 只有 `on` 需要辅助功能权限。这是"永远不会被锁在外面"的保证。
@@ -137,6 +150,13 @@ TCC 责任进程是 `sshd`,会压过它。`curtain` 内部因此用 `launchctl s
   到不了 HID 层,无法自动化测试。Karabiner 那条是主路径。
 - 仅在 Apple Silicon / macOS 26.5.2 上验证过。
 - BetterDisplay 首次运行需要授权。
+
+## 当前验收边界
+
+代码构建、launchd 生命周期、四屏亮度读回、framebuffer 截图、SSH `on/off`
+与 UURemote PID 放行均可自动或远程核验。最终投入无人值守前仍必须由现场人员完成
+一次真实键盘、触控板/鼠标、解除热键和 UURemote 操作验收；在此之前本项目只能算
+“实现与远程链通过、物理输入门待验收”，不能等同于真锁屏或正式安全认证。
 
 ## License
 

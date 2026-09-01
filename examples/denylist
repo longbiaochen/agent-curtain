@@ -9,5 +9,5 @@
 /Library/Application Support/org.pqrs/Karabiner-Elements/Karabiner-Core-Service.app
 /Library/Application Support/org.pqrs/Karabiner-DriverKit-VirtualHIDDevice/Applications/Karabiner-VirtualHIDDevice-Daemon.app
 # dext 在 /Library/SystemExtensions/<UUID>/ 下,UUID 因机器而异。
-# pgrep -f 不展开通配符,故直接用不含路径的进程名匹配。
+# dext 路径无法稳定写死，故直接用可执行文件 basename 精确匹配。
 org.pqrs.Karabiner-DriverKit-VirtualHIDDevice

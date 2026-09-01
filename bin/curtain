@@ -1,41 +1,11 @@
 #!/bin/zsh
-# curtain —— 「幕帘模式」:熄灭所有屏幕并阻断物理键鼠,但保持会话解锁,
-#                  让 GUI agent 继续工作,同时放行白名单内的远程运维工具。
-#
-# ── 安全取舍(请先读这段)──────────────────────────────────────────
-# 本工具的安全强度**低于真锁屏**。会话是解锁的,能绕过输入阻断的人
-# (插一个新键盘、直接重启、拔掉显示器接别的)即可进入桌面。
-# 人不在且没有 GUI agent 任务时,真锁屏仍是更稳妥的选择。
-# 它换来的是:GUI agent 可用 —— 这是真锁屏做不到的(Codex Locked use
-# 因插件冷启动竞态不可靠,Claude Computer Use 官方不支持锁屏)。
-#
-# ── 实测依据(2026-09-01)──────────────────────────────────────────
-# · 物理输入走 kCGHIDEventTap;agent 的 CGEvent.post(.cgSessionEventTap)
-#   不经过该层。对照:基线 session=2 / 阻断中 session=1
-# · UURemote 经 HID 层但带自身 PID(679/679 归属明确),故可按 PID 精确放行
-# · BetterDisplay 亮度归零不影响画面捕获:截图 240.7 vs 基线 241.2
-# · pmset displaysleepnow 会让截图变 0.0 或直接失败 —— 绝不可用于此目的
-# · m1ddc 对内置屏和 DELL U3219Q 写不进去,故改用 BetterDisplay
-# · 显示器必须用 -displayID 定址:name 字段两块小米重名,
-#   originalName 对内置屏(Color LCD)匹配不上
-#
-# ── 用法 ────────────────────────────────────────────────────────
-#   curtain on [秒]   默认无自动解除;传秒数则到点自动解除
-#   curtain off
-#   curtain status
-#   curtain allow     编辑白名单
-#   curtain deny      编辑拒绝名单(优先级高于白名单)
-#
-# ── 解除方式(四重,任一即可)────────────────────────────────────
-#   热键  Ctrl+Opt+Cmd+Shift+U   阻断器在吞事件之前识别它
-#   本地  curtain off
-#   远程  ssh <host> curtain off
-#   超时  仅在显式传入秒数时生效(默认无)
+# curtain —— 熄灭所有屏幕并阻断物理键鼠，同时保持解锁会话和远程运维。
 set -u
 PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 
 BLOCKER=$HOME/.local/libexec/hid-blocker
 BANNER=$HOME/.local/libexec/curtain-banner
+WATCHER=$HOME/.local/libexec/curtain-watchdog
 CONF=$HOME/.config/curtain/allowlist
 DENY=$HOME/.config/curtain/denylist
 STATE=$HOME/.local/state/curtain
@@ -43,121 +13,298 @@ PIDF=$STATE/blocker.pid
 LOG=$STATE/blocker.log
 LUMF=$STATE/brightness.bak
 BANPID=$STATE/banner.pid
-JOB=me.longbiaochen.curtain-blocker
+WATCHLOG=$STATE/watchdog.log
+JOB_BLOCKER=me.longbiaochen.curtain-blocker
+JOB_BANNER=me.longbiaochen.curtain-banner
+JOB_WATCHER=me.longbiaochen.curtain-watchdog
 BD=betterdisplaycli
 mkdir -p $STATE
 
-running() { [[ -f $PIDF ]] && kill -0 $(<$PIDF) 2>/dev/null }
+usage() {
+  print -u2 "用法: curtain {on [秒] [--allow-any-injected]|off|status|doctor|allow|deny}"
+}
 
-# 用 displayID 定址 —— 唯一且稳定
+job_pid() {
+  launchctl print "gui/$(id -u)/$1" 2>/dev/null |
+    awk '$1 == "pid" && $2 == "=" { print $3; exit }'
+}
+
+job_running() {
+  local p
+  p=$(job_pid "$1")
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
+}
+
+blocker_pid() { job_pid "$JOB_BLOCKER" }
+running() { job_running "$JOB_BLOCKER" }
+
 display_ids() {
-  timeout 15 $BD get --identifiers 2>/dev/null | python3 -c "
-import sys,json
-try: objs=json.loads('['+sys.stdin.read().strip()+']')
-except Exception: sys.exit(0)
-for o in objs:
-    i=o.get('displayID')
-    if i: print(i)
-" 2>/dev/null
+  timeout 15 $BD get --identifiers 2>/dev/null | python3 -c '
+import json, sys
+try:
+    objects = json.loads("[" + sys.stdin.read().strip() + "]")
+except Exception:
+    raise SystemExit(0)
+for obj in objects:
+    display_id = obj.get("displayID")
+    if display_id:
+        print(display_id)
+' 2>/dev/null
 }
-dim() {
-  : > $LUMF
-  for i in ${(f)"$(display_ids)"}; do
-    cur=$(timeout 10 $BD get -displayID=$i -brightness 2>/dev/null | tr -d '\n')
-    [[ "$cur" == <->* || "$cur" == 0.* || "$cur" == 1.* ]] || continue
-    print -r -- "$i $cur" >> $LUMF
-    timeout 10 $BD set -displayID=$i -brightness=0 >/dev/null 2>&1
-  done
-}
-undim() {
-  [[ -f $LUMF ]] || return 0
+
+valid_number() { [[ "$1" =~ '^[0-9]+([.][0-9]+)?$' ]] }
+
+restore_file() {
+  local source=$1 claim="${1}.restoring.$$" failed=0 i v
+  [[ -f "$source" ]] || return 0
+  mv "$source" "$claim" 2>/dev/null || return 0
   while read -r i v; do
-    [[ -n "$i" && -n "$v" ]] && timeout 10 $BD set -displayID=$i -brightness=$v >/dev/null 2>&1
-  done < $LUMF
-  rm -f $LUMF
+    [[ -n "$i" && -n "$v" ]] || continue
+    timeout 10 $BD set -displayID="$i" -brightness="$v" >/dev/null 2>&1 || failed=1
+  done < "$claim"
+  if (( failed )); then
+    mv "$claim" "$source"
+    return 1
+  fi
+  rm -f "$claim"
+}
+
+undim() { restore_file "$LUMF" }
+
+restore_orphans() {
+  local orphan failed=0
+  for orphan in ${LUMF}.restoring.*(N); do
+    restore_file "$orphan" || failed=1
+  done
+  return $failed
+}
+
+dim() {
+  local tmp ids i current after
+  [[ ! -f "$LUMF" ]] || {
+    print -u2 "发现未完成的亮度恢复记录，请先运行 curtain off。"
+    return 1
+  }
+  command -v $BD >/dev/null 2>&1 || {
+    print -u2 "未找到 betterdisplaycli；拒绝启用，以免出现亮屏但输入被阻断。"
+    return 1
+  }
+  tmp=$(mktemp "$STATE/brightness.XXXXXX") || return 1
+  ids=(${(f)"$(display_ids)"})
+  if (( ${#ids} == 0 )); then
+    rm -f "$tmp"
+    print -u2 "未发现可由 BetterDisplay 控制的显示器；未启用幕帘。"
+    return 1
+  fi
+  for i in $ids; do
+    current=$(timeout 10 $BD get -displayID="$i" -brightness 2>/dev/null | tr -d '\n')
+    if ! valid_number "$current"; then
+      print -u2 "无法读取 displayID=$i 的亮度；正在回滚。"
+      mv "$tmp" "$LUMF"
+      undim
+      return 1
+    fi
+    print -r -- "$i $current" >> "$tmp"
+    if ! timeout 10 $BD set -displayID="$i" -brightness=0 >/dev/null 2>&1; then
+      print -u2 "无法调暗 displayID=$i；正在回滚。"
+      mv "$tmp" "$LUMF"
+      undim
+      return 1
+    fi
+    after=$(timeout 10 $BD get -displayID="$i" -brightness 2>/dev/null | tr -d '\n')
+    if ! valid_number "$after" || ! awk -v value="$after" 'BEGIN { exit !(value + 0 <= 0.01) }'; then
+      print -u2 "displayID=$i 调暗后读回失败（brightness=$after）；正在回滚。"
+      mv "$tmp" "$LUMF"
+      undim
+      return 1
+    fi
+  done
+  mv "$tmp" "$LUMF"
+}
+
+wait_for_job() {
+  local label=$1 p n=0
+  while (( n < 30 )); do
+    p=$(job_pid "$label")
+    if [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null; then
+      print -r -- "$p"
+      return 0
+    fi
+    sleep 0.1
+    (( n += 1 ))
+  done
+  return 1
+}
+
+wait_for_watcher() {
+  local n=0
+  while job_running "$JOB_WATCHER" && (( n < 150 )); do
+    sleep 0.1
+    (( n += 1 ))
+  done
+  ! job_running "$JOB_WATCHER"
+}
+
+stop_jobs() {
+  launchctl remove "$JOB_BLOCKER" 2>/dev/null || true
+  launchctl remove "$JOB_BANNER" 2>/dev/null || true
 }
 
 case "${1:-status}" in
   on)
-    # 默认无限期 —— 幕帘只应由人主动拉开,不该自己消失。
-    # 底层阻断器需要一个秒数,故用 10 年近似无限期。
-    secs=${2:-315360000}
-    running && { print "已在生效中 (pid $(<$PIDF))"; exit 0 }
-    allow=()
-    [[ -f $CONF ]] && allow=(${(f)"$(grep -vE '^\s*(#|$)' $CONF)"})
-    # 拒绝名单:优先级最高,堵住键盘增强工具重发物理输入的路径
-    deny=()
-    if [[ -f $DENY ]]; then
-      for d in ${(f)"$(grep -vE '^\s*(#|$)' $DENY)"}; do deny+=(--deny "$d"); done
+    shift
+    secs=315360000
+    secs_set=false
+    allow_any=false
+    while (( $# > 0 )); do
+      case "$1" in
+        --allow-any-injected) allow_any=true ;;
+        <->)
+          if $secs_set || (( $1 <= 0 )); then usage; exit 2; fi
+          secs=$1
+          secs_set=true
+          ;;
+        *) usage; exit 2 ;;
+      esac
+      shift
+    done
+
+    if running; then
+      print "已在生效中 (pid $(blocker_pid))"
+      exit 0
     fi
-    dim
-    # 经 launchd 提交,而非直接 fork:
-    # TCC 按「责任进程」归责 —— 从 ssh 会话直接启动时责任进程是 sshd,
-    # 会压过 hid-blocker 自身的辅助功能授权,导致 `on` 在远程失败。
-    # 交给 launchd 后归责回到二进制本身,授权生效。(实测:直接启动失败,
-    # launchctl submit 成功。)
-    : > $LOG
-    launchctl remove $JOB 2>/dev/null
-    launchctl submit -l $JOB -o $LOG -e $LOG -- $BLOCKER $secs $allow $deny
-    sleep 1
-    bpid=$(pgrep -f "$BLOCKER" | head -1)
-    [[ -n "$bpid" ]] || { print "启动失败:"; sed 's/^/  /' $LOG; undim; exit 1 }
-    print $bpid > $PIDF
-    # 看门狗:阻断器无论因超时、热键、SIGTERM 还是崩溃退出,都恢复亮度。
-    # 修复缺陷:此前只有 `off` 会 undim,自动解除会把屏幕永远留在全黑。
-    ( while kill -0 $bpid 2>/dev/null; do sleep 2; done
-      [[ -f $LUMF ]] && while read -r i v; do
-        [[ -n "$i" && -n "$v" ]] && timeout 10 betterdisplaycli set -displayID=$i -brightness=$v >/dev/null 2>&1
-      done < $LUMF
-      [[ -f $BANPID ]] && { kill -TERM $(<$BANPID) 2>/dev/null; rm -f $BANPID }
-      osascript -e 'display notification "已自动解除" with title "curtain"' >/dev/null 2>&1
-      rm -f $LUMF $PIDF ) >/dev/null 2>&1 &
+    orphan_restores=(${LUMF}.restoring.*(N))
+    if job_running "$JOB_WATCHER" || (( ${#orphan_restores} > 0 )); then
+      print -u2 "发现亮度恢复仍在进行，请先运行 curtain off。"
+      exit 1
+    fi
+    for executable in "$BLOCKER" "$BANNER" "$WATCHER"; do
+      [[ -x "$executable" ]] || { print -u2 "缺少可执行文件: $executable（请重新安装）"; exit 1; }
+    done
+
+    allow=()
+    [[ -f "$CONF" ]] && allow=(${(f)"$(grep -vE '^\s*(#|$)' "$CONF")"})
+    deny=()
+    if [[ -f "$DENY" ]]; then
+      for d in ${(f)"$(grep -vE '^\s*(#|$)' "$DENY")"}; do deny+=(--deny "$d"); done
+    fi
+    if $allow_any && (( ${#deny} == 0 )); then
+      print -u2 "--allow-any-injected 需要非空拒绝名单；未启用幕帘。"
+      exit 1
+    fi
+
+    blocker_args=("$secs")
+    $allow_any && blocker_args+=(--allow-any-injected)
+    blocker_args+=($allow $deny)
+
+    dim || exit 1
+    : > "$LOG"
+    : > "$WATCHLOG"
+    launchctl remove "$JOB_BLOCKER" 2>/dev/null || true
+    launchctl remove "$JOB_BANNER" 2>/dev/null || true
+    launchctl remove "$JOB_WATCHER" 2>/dev/null || true
+    launchctl submit -l "$JOB_BLOCKER" -o "$LOG" -e "$LOG" -- "$BLOCKER" $blocker_args
+    bpid=$(wait_for_job "$JOB_BLOCKER") || {
+      print -u2 "阻断器启动失败:"
+      sed 's/^/  /' "$LOG" >&2
+      stop_jobs
+      undim
+      exit 1
+    }
+    print -r -- "$bpid" > "$PIDF"
+
+    launchctl submit -l "$JOB_WATCHER" -o "$WATCHLOG" -e "$WATCHLOG" -- \
+      "$WATCHER" "$bpid" "$PIDF" "$LUMF" "$JOB_BANNER" "$BANPID" "$(command -v $BD)"
+    if ! wait_for_job "$JOB_WATCHER" >/dev/null; then
+      print -u2 "亮度恢复看门狗启动失败；已取消幕帘。"
+      stop_jobs
+      undim
+      rm -f "$PIDF"
+      exit 1
+    fi
+
+    banner_warning=""
+    launchctl submit -l "$JOB_BANNER" -o /dev/null -e /dev/null -- "$BANNER"
+    if banpid=$(wait_for_job "$JOB_BANNER"); then
+      print -r -- "$banpid" > "$BANPID"
+    else
+      banner_warning="（警告：远程提示条未启动）"
+      rm -f "$BANPID"
+    fi
+
     sleep 1
     if ! running; then
-      print "启动失败:"; sed 's/^/  /' $LOG; undim; rm -f $PIDF; exit 1
+      print -u2 "阻断器未保持运行:"
+      sed 's/^/  /' "$LOG" >&2
+      stop_jobs
+      if ! wait_for_watcher; then
+        print -u2 "警告：看门狗未在 15 秒内结束，正在接管恢复。"
+        launchctl remove "$JOB_WATCHER" 2>/dev/null || true
+      fi
+      undim
+      restore_orphans
+      rm -f "$PIDF" "$BANPID"
+      exit 1
     fi
-    # 屏幕提示条:现场看不到(面板全黑),UURemote 能看到
-    $BANNER >/dev/null 2>&1 &
-    print $! > $BANPID
     osascript -e 'display notification "物理键鼠已阻断 · Ctrl+Opt+Cmd+Shift+U 解除" with title "curtain 已启用"' >/dev/null 2>&1
-    sed 's/^/  /' $LOG
+    sed 's/^/  /' "$LOG"
     if (( secs > 100000000 )); then
-      print "已生效。白名单 ${#allow} 项,无自动解除 —— 必须主动拉开。"
+      print "已生效。白名单 ${#allow} 项，无自动解除 $banner_warning"
     else
-      print "已生效。白名单 ${#allow} 项,${secs} 秒后自动解除。"
+      print "已生效。白名单 ${#allow} 项，${secs} 秒后自动解除 $banner_warning"
     fi
-    print "拉开方式(off 不需要辅助功能权限,任何终端都能执行):"
-    print "  · UURemote → 终端 → curtain off      ← 主备用路径,已实测"
-    print "  · ssh <host> curtain off             ← 已实测"
-    print "  · 热键 Ctrl+Opt+Cmd+Shift+U          ← 需真实按键,未验证"
+    print "拉开方式（off 不需要辅助功能权限）:"
+    print "  · UURemote → 终端 → curtain off"
+    print "  · ssh <host> curtain off"
+    print "  · 热键 Ctrl+Opt+Cmd+Shift+U（需真人按键验收）"
     ;;
+
   off)
-    launchctl remove $JOB 2>/dev/null
-    if running; then kill -TERM $(<$PIDF) 2>/dev/null; sleep 2; fi
-    rm -f $PIDF
-    [[ -f $BANPID ]] && { kill -TERM $(<$BANPID) 2>/dev/null; rm -f $BANPID }
+    old_pid=""
+    [[ -f "$PIDF" ]] && old_pid=$(<"$PIDF")
+    launchctl remove "$JOB_BLOCKER" 2>/dev/null || true
+    if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+      kill -TERM "$old_pid" 2>/dev/null || true
+    fi
+    if ! wait_for_watcher; then
+      print -u2 "警告：看门狗未在 15 秒内结束，正在接管恢复。"
+      launchctl remove "$JOB_WATCHER" 2>/dev/null || true
+    fi
+    undim || print -u2 "警告：部分显示器亮度恢复失败，备份仍保留在 $LUMF"
+    restore_orphans || print -u2 "警告：孤立亮度恢复记录仍未完全处理。"
+    launchctl remove "$JOB_BANNER" 2>/dev/null || true
+    if [[ -f "$BANPID" ]]; then
+      kill -TERM "$(<"$BANPID")" 2>/dev/null || true
+    fi
+    rm -f "$PIDF" "$BANPID"
     osascript -e 'display notification "已恢复正常" with title "curtain 已解除"' >/dev/null 2>&1
-    undim
-    tail -1 $LOG 2>/dev/null | sed 's/^/  /'
-    print "已解除,亮度已恢复。"
+    tail -1 "$LOG" 2>/dev/null | sed 's/^/  /'
+    print "已解除，亮度已恢复。"
     ;;
+
   status)
-    if running; then print "阻断: 生效中 (pid $(<$PIDF))"; head -1 $LOG | sed 's/^/  /'
-    else print "阻断: 未生效"; fi
+    if running; then
+      print "阻断: 生效中 (pid $(blocker_pid))"
+      head -1 "$LOG" 2>/dev/null | sed 's/^/  /'
+    else
+      print "阻断: 未生效"
+    fi
     print -n "锁屏: "
-    python3 -c "
-import subprocess,plistlib
-o=subprocess.run(['ioreg','-n','Root','-d1','-a'],capture_output=True).stdout
-d=plistlib.loads(o); r=d[0] if isinstance(d,list) else d
-print(r.get('IOConsoleUsers',[{}])[0].get('CGSSessionScreenIsLocked','False'))
-" 2>/dev/null || print "?"
-    if [[ -f $BANPID ]] && kill -0 $(<$BANPID) 2>/dev/null; then print "提示条: 显示中"; else print "提示条: 未显示"; fi
+    python3 -c '
+import plistlib, subprocess
+output = subprocess.run(["ioreg", "-n", "Root", "-d1", "-a"], capture_output=True).stdout
+data = plistlib.loads(output)
+root = data[0] if isinstance(data, list) else data
+print(root.get("IOConsoleUsers", [{}])[0].get("CGSSessionScreenIsLocked", "False"))
+' 2>/dev/null || print "?"
+    if job_running "$JOB_BANNER"; then print "提示条: 显示中"; else print "提示条: 未显示"; fi
+    if job_running "$JOB_WATCHER"; then print "看门狗: 生效中"; else print "看门狗: 未托管"; fi
     print "白名单:"
-    [[ -f $CONF ]] && grep -vE '^\s*(#|$)' $CONF | while read -r p; do
+    [[ -f "$CONF" ]] && grep -vE '^\s*(#|$)' "$CONF" | while read -r p; do
       print "  [$(pgrep -f "$p" 2>/dev/null | wc -l | tr -d ' ') 个进程] $p"
     done
-    print "拒绝名单(优先级最高):"
-    [[ -f $DENY ]] && grep -vE '^\s*(#|$)' $DENY | while read -r d; do
+    print "拒绝名单（优先级最高）:"
+    [[ -f "$DENY" ]] && grep -vE '^\s*(#|$)' "$DENY" | while read -r d; do
       print "  [$(pgrep -f "$d" 2>/dev/null | wc -l | tr -d ' ') 个进程] ${d:t}"
     done
     print "显示器:"
@@ -165,7 +312,36 @@ print(r.get('IOConsoleUsers',[{}])[0].get('CGSSessionScreenIsLocked','False'))
       print "  displayID=$i brightness=$(timeout 10 $BD get -displayID=$i -brightness 2>/dev/null | tr -d '\n')"
     done
     ;;
-  allow) ${EDITOR:-vi} $CONF ;;
-  deny)  ${EDITOR:-vi} $DENY ;;
-  *) print "用法: curtain {on [秒]|off|status|allow|deny}" >&2; exit 2 ;;
+
+  doctor)
+    failures=0
+    for command_name in swiftc betterdisplaycli timeout launchctl python3; do
+      if command -v "$command_name" >/dev/null 2>&1; then
+        print "[ok] $command_name=$(command -v "$command_name")"
+      else
+        print "[fail] 缺少 $command_name"
+        failures=1
+      fi
+    done
+    for executable in "$BLOCKER" "$BANNER" "$WATCHER"; do
+      if [[ -x "$executable" ]]; then print "[ok] $executable"; else print "[fail] $executable"; failures=1; fi
+    done
+    if [[ -f "$DENY" ]] && [[ -n "$(grep -vE '^\s*(#|$)' "$DENY")" ]]; then
+      print "[ok] 拒绝名单已配置"
+    else
+      print "[fail] 拒绝名单缺失或为空"
+      failures=1
+    fi
+    ids=(${(f)"$(display_ids)"})
+    if (( ${#ids} > 0 )); then print "[ok] BetterDisplay 发现 ${#ids} 块显示器"; else print "[fail] 未发现显示器"; failures=1; fi
+    if [[ -x "$BLOCKER" ]]; then
+      signature=$(codesign -dvv "$BLOCKER" 2>&1 | awk -F= '/^Authority=|^Signature=/{print $2; exit}')
+      [[ -n "$signature" ]] && print "[info] hid-blocker 签名: $signature"
+    fi
+    exit $failures
+    ;;
+
+  allow) ${EDITOR:-vi} "$CONF" ;;
+  deny)  ${EDITOR:-vi} "$DENY" ;;
+  *) usage; exit 2 ;;
 esac

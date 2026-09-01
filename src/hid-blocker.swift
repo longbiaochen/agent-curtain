@@ -1,4 +1,5 @@
 import Cocoa
+import Darwin
 
 // hid-blocker —— screen-guard 的阻断内核。
 //
@@ -31,25 +32,56 @@ var blockedCount = 0
 var allowedCount = 0
 let lock = NSLock()
 var tapRef: CFMachPort?
+var signalSources: [DispatchSourceSignal] = []
 
-func pidsFor(_ paths: [String]) -> Set<Int32> {
+func processSnapshot() -> [(pid: Int32, path: String)] {
+    let capacity = proc_listallpids(nil, 0)
+    guard capacity > 0 else { return [] }
+    var pids = [pid_t](repeating: 0, count: Int(capacity))
+    let bytes = Int32(pids.count * MemoryLayout<pid_t>.size)
+    let actual = pids.withUnsafeMutableBytes { raw in
+        proc_listallpids(raw.baseAddress, bytes)
+    }
+    guard actual > 0 else { return [] }
+
+    var result: [(Int32, String)] = []
+    for pid in pids.prefix(Int(actual)) where pid > 0 {
+        var buffer = [CChar](repeating: 0, count: 4096)
+        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { continue }
+        result.append((pid, URL(fileURLWithPath: String(cString: buffer))
+            .standardizedFileURL.resolvingSymlinksInPath().path))
+    }
+    return result
+}
+
+func resolvedRule(_ raw: String) -> (path: String?, name: String?) {
+    guard raw.hasPrefix("/") else { return (nil, raw) }
+    let standardized = URL(fileURLWithPath: raw).standardizedFileURL.resolvingSymlinksInPath()
+    if standardized.pathExtension == "app",
+       let executable = Bundle(url: standardized)?.executableURL {
+        return (executable.standardizedFileURL.resolvingSymlinksInPath().path, nil)
+    }
+    return (standardized.path, nil)
+}
+
+func pidsFor(_ rules: [String], in processes: [(pid: Int32, path: String)]) -> Set<Int32> {
+    let resolved = rules.map(resolvedRule)
     var found = Set<Int32>()
-    for path in paths {
-        let p = Process()
-        p.launchPath = "/usr/bin/pgrep"
-        p.arguments = ["-f", path]
-        let pipe = Pipe(); p.standardOutput = pipe; p.standardError = Pipe()
-        do { try p.run() } catch { continue }
-        p.waitUntilExit()
-        let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        for line in out.split(separator: "\n") {
-            if let pid = Int32(line.trimmingCharacters(in: .whitespaces)) { found.insert(pid) }
+    for process in processes {
+        let executableName = URL(fileURLWithPath: process.path).lastPathComponent
+        if resolved.contains(where: { rule in
+            if let path = rule.path { return process.path == path }
+            if let name = rule.name { return executableName == name }
+            return false
+        }) {
+            found.insert(process.pid)
         }
     }
     return found
 }
 func refreshPIDs() {
-    let a = pidsFor(allowedPaths), d = pidsFor(deniedPaths)
+    let processes = processSnapshot()
+    let a = pidsFor(allowedPaths, in: processes), d = pidsFor(deniedPaths, in: processes)
     lock.lock(); allowedPIDs = a; deniedPIDs = d; lock.unlock()
 }
 
@@ -140,6 +172,11 @@ fflush(stdout)
 Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { _ in refreshPIDs() }
 // 硬性自动解除
 DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { release("timeout") }
-signal(SIGTERM) { _ in release("SIGTERM") }
-signal(SIGINT)  { _ in release("SIGINT") }
+for (number, reason) in [(SIGTERM, "SIGTERM"), (SIGINT, "SIGINT")] {
+    signal(number, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: number, queue: .main)
+    source.setEventHandler { release(reason) }
+    source.resume()
+    signalSources.append(source)
+}
 CFRunLoopRun()
