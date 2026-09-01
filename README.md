@@ -1,162 +1,285 @@
 # agent-curtain
 
-**拉上幕帘,后台照常演出。**
+**Draw the curtain; the show goes on behind it.**
 
-macOS 上的「假锁屏」:熄灭全部显示器、阻断物理键鼠,但**保持会话解锁**,
-让 GUI agent 继续工作,同时按 PID 精确放行远程桌面工具。
+A "fake lock screen" for macOS: blank every display and swallow physical
+keyboard/mouse input, while keeping the login session **unlocked** so GUI
+agents keep working — and while letting whitelisted remote-desktop tools
+through, identified by process ID.
+
+[中文版](README.zh-CN.md) · [Measurements](docs/FINDINGS.md)
+
+![curtain banner](docs/img/banner.png)
 
 ```
-curtain on      # 四块屏全黑,物理键鼠失效,agent 照常
-curtain on 300  # 5 分钟后自动解除
-curtain on --allow-any-injected  # 放行软件注入，但仍应用拒绝名单
-curtain off     # 拉开
+curtain on      # all displays dark, physical input dead, agents unaffected
+curtain off     # draw it back
 curtain status
-curtain doctor
 ```
 
-## 解决什么问题
+---
 
-一台常驻办公室、跑着无人值守 agent 的 Mac。会有人进来,但真锁屏会让
-GUI agent 全部停摆:
+## 1. Background
 
-- **Codex Locked use** 有插件冷启动竞态,不可靠
-- **Claude Computer Use** 官方不支持锁屏
+GUI agents — Claude Computer Use, OpenAI Codex Computer Use, and similar
+tools — drive a Mac the way a person does: they screenshot the display,
+then post synthetic mouse and keyboard events. This makes them uniquely
+capable (they reach native apps and GUI-only tools that have no API) and
+uniquely fragile: they need a live, rendering, unlocked desktop.
 
-于是只剩两个坏选项:锁屏但 agent 停工,或不锁屏但桌面裸奔。
+That fragility is invisible on a laptop you carry around. It becomes the
+central constraint on an **always-on workstation** — a machine that sits in
+an office running unattended agent work for hours.
 
-`agent-curtain` 提供第三条:**屏幕全黑 + 物理输入失效 + agent 照常 + 远程运维照常**。
+## 2. Problem
 
-## 原理
+An always-on machine in a shared space has two requirements that, on macOS
+today, are mutually exclusive:
 
-macOS 事件分层:物理键鼠进入 `kCGHIDEventTap`;agent 用
-`CGEvent.post(tap:.cgSessionEventTap)` 注入的合成事件**不经过该层**。
+| Requirement | Mechanism | Effect on GUI agents |
+|---|---|---|
+| Nobody who walks in can see or use it | Screen lock | **Agents stop entirely** |
+| Agents keep working unattended | No lock | **Desktop fully exposed** |
 
-所以阻断器挂在 HID 层时,只吞物理输入,对 agent 完全透明。
-远程桌面工具经 HID 层但事件带自身 PID,可按 PID 精确放行。
+Neither half is optional, and macOS offers no middle ground. Locking is not
+a matter of degree — the moment `CGSSessionScreenIsLocked` flips, the window
+server stops compositing for the session and every screenshot-driven agent
+goes blind.
 
-完整实测数据见 [docs/FINDINGS.md](docs/FINDINGS.md)。
+## 3. Existing approaches, and why they fail
 
-## ⚠️ 安全边界
+### 3.1 Vendor lock-screen support
 
-**本工具的安全强度低于真锁屏。** 会话是解锁的,能绕过输入阻断的人
-——插一个新键盘、直接重启、把硬盘拆走——即可进入桌面。
+**OpenAI Codex "Locked use"** installs an authorization plug-in that
+participates in the macOS unlock flow, temporarily unlocking for an active
+Computer Use turn while covering all displays. The design is sound. In
+practice we measured a **plug-in cold-start race**: after the screen locks,
+`SecurityAgentHelper` needs time to load the plug-in, but Computer Use's
+post-submission validation window is roughly 2 s. The plug-in finished
+creating ~0.34 s too late and the attempt received `DENY`; the retry
+overlapped the previous authorization chain and exhausted the allowance.
 
-它挡的是**机会型闯入**(同事路过、访客进门),不是有准备的攻击者。
-人不在且没有 GUI agent 任务时,真锁屏仍是更稳妥的选择。
+**Anthropic Claude Computer Use** does not attempt this. The documentation
+is explicit: *"your computer needs to be awake and the Claude Desktop app
+needs to be open."*
 
-配合 FileVault 使用;不要用它保护高价值数据。
+### 3.2 Overlay / privacy-shield apps
 
-## 安装
+Several apps paint a full-screen passcode overlay while leaving the session
+unlocked. This preserves the *session*, but not the *agent*: since macOS 15,
+`ScreenCaptureKit` ignores `NSWindow.sharingType = .none`, so the overlay is
+captured too. The agent sees the passcode screen instead of the app it is
+supposed to drive. Overlays trade the same capability that locking does,
+while providing strictly weaker security.
+
+### 3.3 Display sleep
+
+`pmset displaysleepnow` blanks every panel and looks like an elegant answer.
+It is not: display sleep stops the window server from compositing. Measured
+screenshots during display sleep came back at **0.0/255** (pure black), and
+on some displays `screencapture` failed outright.
+
+## 4. Contribution
+
+`agent-curtain` occupies the gap all three approaches leave open:
+
+- **Blank** every display via DDC brightness, which does **not** touch the
+  framebuffer — agents keep seeing real content.
+- **Swallow** physical keyboard and mouse input at the HID event tap, a
+  layer that agent-injected events never traverse.
+- **Pass through** remote-desktop tools by process ID, so the operator
+  retains remote control while a bystander cannot type.
+- Keep the session **unlocked** throughout, so GUI agents are untouched.
+
+## 5. Technical approach
+
+### 5.1 Event layering
+
+macOS delivers physical input at `kCGHIDEventTap`. Agents post synthetic
+events with `CGEvent.post(tap: .cgSessionEventTap)`, which enters
+*downstream* of the HID tap.
+
+```mermaid
+flowchart LR
+    HW["Physical keyboard / mouse"] --> HID["kCGHIDEventTap<br/>← blocker sits here"]
+    HID --> SESSION["kCGSessionEventTap"]
+    AGENT["Agent<br/>CGEvent.post(.cgSessionEventTap)"] --> SESSION
+    RDP["Remote desktop<br/>(software injection)"] --> HID
+    SESSION --> APPS["Applications"]
+```
+
+A tap installed at the HID layer therefore cannot see — and cannot block —
+agent input. This is the property the whole design rests on, and it is
+measured rather than assumed (§6.1).
+
+### 5.2 Identifying the injector
+
+Remote-desktop tools inject in software but still traverse the HID layer.
+Their events carry the injecting process in
+`CGEventField.eventSourceUnixProcessID`; genuine hardware events report `0`.
+The blocker reads this field and consults an allowlist resolved from
+executable paths (refreshed periodically, so a restarted process keeps
+working).
+
+### 5.3 Denylist: designing around an unmeasurable
+
+"Allow everything with `pid != 0`" would remove configuration entirely. It
+carries one risk: a keyboard-enhancement tool (Karabiner-Elements) grabs the
+physical keyboard and re-emits events through its own virtual HID device. If
+those re-emitted events carried a non-zero PID, physical input would be
+allowed wholesale and the blocker would be defeated.
+
+Rather than determine which is true, `agent-curtain` uses a **denylist** that
+overrides everything else and ships with Karabiner's components in it:
+
+| If re-emitted events | Denylist effect |
+|---|---|
+| carry a non-zero PID | blocks them; physical input stays blocked |
+| are `pid = 0` | harmless no-op; they were already blocked |
+
+**Safe under both.** The unmeasurable quantity never has to be measured.
+
+### 5.4 TCC responsibility
+
+Creating an event tap needs Accessibility permission, and macOS attributes
+it to the **responsible process**, not the binary:
+
+| Launch path | Responsible process | `curtain on` |
+|---|---|---|
+| Authorized interactive shell | that shell | ✅ |
+| SSH (direct fork) | `sshd` | ❌ |
+| launchd | the binary itself (needs its own grant) | ✅ * |
+| AppleScript applet | the applet | ❌ |
+
+\* Deliberately not used. Making SSH arming work requires granting
+Accessibility to a binary that can swallow all physical input, and lets
+anyone with SSH arm it. `agent-curtain` forks directly instead, so only an
+already-authorized interactive terminal can arm.
+
+**`curtain off` needs no permission at all** — it sends `SIGTERM` and
+restores brightness. That asymmetry is the guarantee that you can never lock
+yourself out.
+
+## 6. Evaluation
+
+Measured on MacBook Pro 18,4 / macOS 26.5.2 / four displays. Full data and
+method in [docs/FINDINGS.md](docs/FINDINGS.md).
+
+### 6.1 Layer separation
+
+Listen-only taps at both layers; one synthetic event injected into each:
+
+| Injected into | Observed at HID | Observed at session |
+|---|---|---|
+| `.cgSessionEventTap` | 0 | 1 |
+| `.cghidEventTap` | 1 | 1 |
+
+Session-injected events do not reach the HID layer.
+
+### 6.2 Blocking is selective
+
+Same two injections, with the blocker active:
+
+| | HID tap | Session tap |
+|---|---|---|
+| Baseline | 1 | **2** |
+| Blocking | 1 | **1** |
+
+The missing event is the HID-injected one. The session-injected one passed
+through untouched.
+
+### 6.3 Remote desktop passes through
+
+PID attribution over a 45 s window of real remote-desktop use:
+
+```
+RESULT total=679
+  pid=58218  n=679  UURemoteServer
+```
+
+All 679 events attributed. During a subsequent real session with the
+allowlist active:
+
+```
+RELEASED (SIGTERM) blocked=0 allowed=1936
+```
+
+### 6.4 Blanking preserves capture
+
+| Method | Panels | `screencapture` |
+|---|---|---|
+| Baseline | lit | 241.2 / 255 |
+| DDC brightness → 0 | dark | **222.6 / 255** (real content) |
+| `pmset displaysleepnow` | dark | **0.0 / 255**, some displays fail |
+
+### 6.5 Banner rendering
+
+Verified by scanning all four framebuffers for the banner's signature color
+— roughly 4,900 matching pixels per display. The banner is invisible to
+someone standing at the machine (panels are dark) but visible over remote
+desktop (which reads the framebuffer).
+
+## 7. Discussion
+
+### 7.1 Security model
+
+`agent-curtain` is **weaker than a real lock screen**, by construction. The
+session stays unlocked; anyone who can bypass input blocking — plug in a new
+keyboard, reboot, pull the disk — reaches the desktop.
+
+It defends against **opportunistic access**: a colleague walking past, a
+visitor in the room. It does not defend against a prepared attacker. Use it
+with FileVault, and do not use it to protect high-value data. When nobody is
+around *and* no GUI agent work is pending, a real lock screen remains the
+better choice.
+
+### 7.2 What is still unverified
+
+**The core behavior — that physical input is actually blocked — has not been
+verified with a real keypress.** Every measurement above used programmatic
+injection; the `blocked` counter has never been incremented by a human at
+the keyboard. The layering evidence is strong and the denylist covers the
+known bypass, but treat this as an open item until you confirm it on your
+own machine.
+
+The release hotkey is unverified for the same reason: programmatically
+synthesized keyboard events do not reach the HID layer, so it cannot be
+tested automatically.
+
+### 7.3 Portability
+
+Developed and measured on a single Apple Silicon machine running macOS
+26.5.2. The event-layering behavior is a documented Core Graphics property
+and should hold broadly; the TCC responsibility matrix and DDC quirks are
+more likely to vary.
+
+DDC control uses BetterDisplay because `m1ddc` could not write to the
+built-in display or a DELL U3219Q. Displays must be addressed by
+`-displayID`: `name` collided across two identical monitors, and
+`originalName` did not match the built-in display.
+
+---
+
+## Installation
 
 ```bash
-git clone https://github.com/<you>/agent-curtain.git
+git clone https://github.com/longbiaochen/agent-curtain.git
 cd agent-curtain && ./install.sh
 ```
 
-依赖:
-- macOS(在 26.5.2 / Apple Silicon 上开发验证)
-- Xcode Command Line Tools(`swiftc`)
-- [BetterDisplay](https://betterdisplay.pro/) —— 调光后端,`brew install --cask betterdisplay`
-- (可选)Karabiner-Elements —— 热键宿主
+Requirements: macOS, Xcode Command Line Tools, [BetterDisplay](https://betterdisplay.pro/)
+(`brew install --cask betterdisplay`), optionally Karabiner-Elements for hotkeys.
 
-安装脚本会优先使用本机的 `Developer ID Application` 身份，并启用 Hardened
-Runtime 与安全时间戳。安装后**必须**给 `~/.local/libexec/hid-blocker`
-授予一次辅助功能权限:
-系统设置 → 隐私与安全性 → 辅助功能 → 添加该二进制。
+Arm from an interactive terminal that already holds Accessibility permission
+(Terminal.app, or a terminal opened inside a remote-desktop session).
 
-> 没有 Developer ID 时会退回 ad-hoc 签名；这种情况下重新编译后需要重新授权。
-> 旧授权行仍会留在 TCC.db 里,看起来像已授权 —— 这是个很容易误判的坑。
+## Configuration
 
-安装后运行 `curtain doctor`，确认依赖、三项安装产物、拒绝名单和显示器发现均通过。
+- `~/.config/curtain/allowlist` — executable paths whose events pass through
+- `~/.config/curtain/denylist` — always blocked, overrides everything
 
-## 白名单
-
-`~/.config/curtain/allowlist`,每行一个可执行文件路径。阻断器通过
-`proc_listallpids` + `proc_pidpath` 读取真实可执行文件路径并精确匹配，
-每 3 秒刷新 PID,因此进程重启换了 PID 依然有效。
-
-```
-/Applications/UURemote.app/Contents/Helpers/UURemoteServer
-```
-
-agent 的合成事件走 session 层、不经过 HID 层,**无需**列在这里。
-
-### 免配置模式(有风险)
-
-物理输入的 `pid` 恒为 0,软件注入的事件带发起进程 PID。所以理论上
-「放行一切 `pid != 0`」就能免去白名单:
-
-```
-curtain on --allow-any-injected
-```
-
-这个模式的风险由**拒绝名单**兜住。
-
-### 拒绝名单
-
-`~/.config/curtain/denylist`,优先级**高于**白名单和 `--allow-any-injected`。
-
-存在的理由:键盘增强工具(如 Karabiner-Elements)抓取物理键盘后,经自身虚拟
-HID 设备重发事件。若重发事件带非零 PID,「放行一切 `pid != 0`」会把物理键盘
-整体放行,阻断器失效。
-
-安装脚本默认写入包含 Karabiner 三个组件的拒绝名单。这个设计的好处是
-**不依赖对未知行为的
-判断**:若重发事件带 PID,拒绝名单堵住它;若它们其实是 `pid=0`(DriverKit
-设备的常见行为),拒绝名单是无害的空操作。**两种情况下都安全。**
-
-```bash
-curtain deny     # 编辑拒绝名单
-curtain status   # 查看解析到的进程数
-```
-
-## 拉开方式
-
-| 方式 | 需要辅助功能权限 |
-|---|---|
-| 远程桌面 → 终端 → `curtain off` | 否 |
-| `ssh <host> curtain off` | 否 |
-| 热键 `Ctrl+Opt+Cmd+Shift+U` | 否(Karabiner 宿主) |
-| `curtain on 3600` 显式超时 | — |
-
-`curtain on` 需要辅助功能权限,且**仅授权二进制还不够** —— 从 ssh 直接 fork 时
-TCC 责任进程是 `sshd`,会压过它。`curtain` 内部因此用 `launchctl submit` 启动
-阻断器,归责回到二进制本身。实测 ssh 远程 `on`/`off` 往返均可用。
-
-阻断器、远程提示条和亮度恢复看门狗分别由 launchd 托管。看门狗以阻断器 PID
-为真相源；阻断器因超时、热键、SIGTERM 或崩溃退出后都会恢复亮度并关闭提示条，
-不依赖发起 `curtain on` 的 SSH shell 继续存活。
-
-**`curtain off` 不需要任何权限** —— 它只是发 SIGTERM 加恢复亮度。
-只有 `on` 需要辅助功能权限。这是"永远不会被锁在外面"的保证。
-
-默认**无自动解除**:幕帘只应由人主动拉开。需要超时就显式传秒数。
-
-## 设计细节
-
-- **看门狗**:阻断器以任何方式退出(超时/热键/SIGTERM/崩溃)都恢复亮度
-- **tap 自愈**:捕获 `tapDisabledByTimeout` / `ByUserInput` 后自动重新启用
-- **提示条**:顶部居中横幅。物理屏是黑的所以现场看不到,但远程桌面看的是
-  framebuffer 所以能看到。`ignoresMouseEvents`,不干扰 agent 点击
-- **多屏**:插拔显示器自动重建横幅
-
-## 已知限制
-
-- **「物理输入被阻断」这一核心行为尚未用真实按键验证过。** 开发期间所有测试
-  均为程序化注入,`blocked` 计数从未由真人按键产生。逻辑与分层证据充分
-  (见 FINDINGS.md),拒绝名单也覆盖了已知的绕过路径,但请在你自己的机器上
-  实测后再依赖它。
-- `hid-blocker` 内置的解除热键同样未经真实按键验证 —— 程序化模拟的键盘事件
-  到不了 HID 层,无法自动化测试。Karabiner 那条是主路径。
-- 仅在 Apple Silicon / macOS 26.5.2 上验证过。
-- BetterDisplay 首次运行需要授权。
-
-## 当前验收边界
-
-代码构建、launchd 生命周期、四屏亮度读回、framebuffer 截图、SSH `on/off`
-与 UURemote PID 放行均可自动或远程核验。最终投入无人值守前仍必须由现场人员完成
-一次真实键盘、触控板/鼠标、解除热键和 UURemote 操作验收；在此之前本项目只能算
-“实现与远程链通过、物理输入门待验收”，不能等同于真锁屏或正式安全认证。
+Agent events travel the session layer and never reach the HID tap, so they
+do **not** need to be listed.
 
 ## License
 
