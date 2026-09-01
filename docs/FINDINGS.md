@@ -79,11 +79,26 @@ display 4: 110 → 写 0 → 110   ✗
 | 启动方式 | 责任进程 | `curtain on` |
 |---|---|---|
 | 已授权的交互式 shell | 该 shell | ✅ |
-| SSH | `sshd` | ❌ |
-| launchd | `launchd` | ❌ |
+| SSH 直接 fork | `sshd` | ❌ |
+| **SSH → `launchctl submit`** | **二进制自身** | **✅** |
 | AppleScript applet | applet 自身 | ❌ |
 
-因此 `hid-blocker` 必须持有自己的授权。**授权绑定代码签名哈希,
+关键点:**给 `hid-blocker` 自己授权还不够** —— 从 ssh 会话直接 fork 时,
+责任进程是 `sshd`,会压过二进制自身的授权。必须交给 launchd 启动,
+归责才回到二进制本身。
+
+实测对比(授权已就位的前提下):
+
+```
+ssh → 直接启动           FAIL: 缺少辅助功能授权
+ssh → launchctl submit   ARMED ✅
+```
+
+`launchctl asuser` 不行:非 root 时报
+`Could not switch to audit session: Operation not permitted`;
+加 `sudo -u` 后归责链又变,仍然失败。
+
+因此 `curtain on` 内部使用 `launchctl submit`。**授权绑定代码签名哈希,
 重新编译后失效**(旧授权行仍留在 TCC.db 里,看起来像已授权,极易误判)。
 
 **但 `curtain off` 不需要任何权限** —— 它只是发 SIGTERM 加恢复亮度,

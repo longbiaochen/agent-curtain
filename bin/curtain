@@ -43,6 +43,7 @@ PIDF=$STATE/blocker.pid
 LOG=$STATE/blocker.log
 LUMF=$STATE/brightness.bak
 BANPID=$STATE/banner.pid
+JOB=me.longbiaochen.curtain-blocker
 BD=betterdisplaycli
 mkdir -p $STATE
 
@@ -90,8 +91,17 @@ case "${1:-status}" in
       for d in ${(f)"$(grep -vE '^\s*(#|$)' $DENY)"}; do deny+=(--deny "$d"); done
     fi
     dim
-    $BLOCKER $secs $allow $deny > $LOG 2>&1 &
-    bpid=$!
+    # 经 launchd 提交,而非直接 fork:
+    # TCC 按「责任进程」归责 —— 从 ssh 会话直接启动时责任进程是 sshd,
+    # 会压过 hid-blocker 自身的辅助功能授权,导致 `on` 在远程失败。
+    # 交给 launchd 后归责回到二进制本身,授权生效。(实测:直接启动失败,
+    # launchctl submit 成功。)
+    : > $LOG
+    launchctl remove $JOB 2>/dev/null
+    launchctl submit -l $JOB -o $LOG -e $LOG -- $BLOCKER $secs $allow $deny
+    sleep 1
+    bpid=$(pgrep -f "$BLOCKER" | head -1)
+    [[ -n "$bpid" ]] || { print "启动失败:"; sed 's/^/  /' $LOG; undim; exit 1 }
     print $bpid > $PIDF
     # 看门狗:阻断器无论因超时、热键、SIGTERM 还是崩溃退出,都恢复亮度。
     # 修复缺陷:此前只有 `off` 会 undim,自动解除会把屏幕永远留在全黑。
@@ -122,6 +132,7 @@ case "${1:-status}" in
     print "  · 热键 Ctrl+Opt+Cmd+Shift+U          ← 需真实按键,未验证"
     ;;
   off)
+    launchctl remove $JOB 2>/dev/null
     if running; then kill -TERM $(<$PIDF) 2>/dev/null; sleep 2; fi
     rm -f $PIDF
     [[ -f $BANPID ]] && { kill -TERM $(<$BANPID) 2>/dev/null; rm -f $BANPID }

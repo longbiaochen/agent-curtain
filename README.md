@@ -110,6 +110,10 @@ curtain status   # 查看解析到的进程数
 | 热键 `Ctrl+Opt+Cmd+Shift+U` | 否(Karabiner 宿主) |
 | `curtain on 3600` 显式超时 | — |
 
+`curtain on` 需要辅助功能权限,且**仅授权二进制还不够** —— 从 ssh 直接 fork 时
+TCC 责任进程是 `sshd`,会压过它。`curtain` 内部因此用 `launchctl submit` 启动
+阻断器,归责回到二进制本身。实测 ssh 远程 `on`/`off` 往返均可用。
+
 **`curtain off` 不需要任何权限** —— 它只是发 SIGTERM 加恢复亮度。
 只有 `on` 需要辅助功能权限。这是"永远不会被锁在外面"的保证。
 
