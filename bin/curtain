@@ -35,8 +35,13 @@ job_running() {
   [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
 }
 
-blocker_pid() { job_pid "$JOB_BLOCKER" }
-running() { job_running "$JOB_BLOCKER" }
+# 阻断器改为直接 fork(见 `on` 分支注释),故按 PID 文件判断存活,
+# 而非 launchd 任务。看门狗与提示条仍由 launchd 托管,沿用 job_running。
+blocker_pid() { [[ -f "$PIDF" ]] && print -r -- "$(<$PIDF)" }
+running() {
+  local p=$(blocker_pid)
+  [[ -n "$p" ]] && kill -0 "$p" 2>/dev/null
+}
 
 display_ids() {
   timeout 15 $BD get --identifiers 2>/dev/null | python3 -c '
@@ -203,14 +208,23 @@ case "${1:-status}" in
     launchctl remove "$JOB_BLOCKER" 2>/dev/null || true
     launchctl remove "$JOB_BANNER" 2>/dev/null || true
     launchctl remove "$JOB_WATCHER" 2>/dev/null || true
-    launchctl submit -l "$JOB_BLOCKER" -o "$LOG" -e "$LOG" -- "$BLOCKER" $blocker_args
-    bpid=$(wait_for_job "$JOB_BLOCKER") || {
+    # 直接 fork,而非 launchctl submit。
+    # 权衡(2026-09-01):经 launchd 提交可让 ssh 远程 `curtain on` 生效,
+    # 但那要求 hid-blocker 持有自己的辅助功能授权 —— 等于给一个能吞掉全部
+    # 物理输入的二进制常驻授权,且任何能 ssh 进来的人都能启用它。权限过大。
+    # 改为直接 fork:归责到调用方 shell,因此只有已授权的交互式终端
+    # (本机 Terminal、远程桌面里的终端)能启用,ssh 直接启用不再可行。
+    # `curtain off` 不受影响,任何终端都能执行。
+    "$BLOCKER" $blocker_args > "$LOG" 2>&1 &
+    bpid=$!
+    sleep 1
+    if ! kill -0 "$bpid" 2>/dev/null; then
       print -u2 "阻断器启动失败:"
       sed 's/^/  /' "$LOG" >&2
       stop_jobs
       undim
       exit 1
-    }
+    fi
     print -r -- "$bpid" > "$PIDF"
 
     launchctl submit -l "$JOB_WATCHER" -o "$WATCHLOG" -e "$WATCHLOG" -- \
@@ -224,11 +238,16 @@ case "${1:-status}" in
     fi
 
     banner_warning=""
-    launchctl submit -l "$JOB_BANNER" -o /dev/null -e /dev/null -- "$BANNER"
-    if banpid=$(wait_for_job "$JOB_BANNER"); then
+    # 提示条同样直接 fork。经 launchctl submit 时进程会立刻退出
+    # (拿不到 window server 连接),而 status 只查 launchd 任务存在与否,
+    # 于是出现「报显示中但四块屏都扫不到横幅」的假阳性。
+    "$BANNER" >/dev/null 2>&1 &
+    banpid=$!
+    sleep 1
+    if kill -0 "$banpid" 2>/dev/null; then
       print -r -- "$banpid" > "$BANPID"
     else
-      banner_warning="（警告：远程提示条未启动）"
+      banner_warning="（警告：提示条未启动）"
       rm -f "$BANPID"
     fi
 
@@ -297,7 +316,9 @@ data = plistlib.loads(output)
 root = data[0] if isinstance(data, list) else data
 print(root.get("IOConsoleUsers", [{}])[0].get("CGSSessionScreenIsLocked", "False"))
 ' 2>/dev/null || print "?"
-    if job_running "$JOB_BANNER"; then print "提示条: 显示中"; else print "提示条: 未显示"; fi
+    if [[ -f "$BANPID" ]] && kill -0 "$(<$BANPID)" 2>/dev/null; then
+      print "提示条: 显示中 (pid $(<$BANPID))"
+    else print "提示条: 未显示"; fi
     if job_running "$JOB_WATCHER"; then print "看门狗: 生效中"; else print "看门狗: 未托管"; fi
     print "白名单:"
     [[ -f "$CONF" ]] && grep -vE '^\s*(#|$)' "$CONF" | while read -r p; do
