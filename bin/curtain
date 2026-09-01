@@ -24,6 +24,7 @@
 #   curtain off
 #   curtain status
 #   curtain allow     编辑白名单
+#   curtain deny      编辑拒绝名单(优先级高于白名单)
 #
 # ── 解除方式(四重,任一即可)────────────────────────────────────
 #   热键  Ctrl+Opt+Cmd+Shift+U   阻断器在吞事件之前识别它
@@ -36,6 +37,7 @@ PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 BLOCKER=$HOME/.local/libexec/hid-blocker
 BANNER=$HOME/.local/libexec/curtain-banner
 CONF=$HOME/.config/curtain/allowlist
+DENY=$HOME/.config/curtain/denylist
 STATE=$HOME/.local/state/curtain
 PIDF=$STATE/blocker.pid
 LOG=$STATE/blocker.log
@@ -82,8 +84,13 @@ case "${1:-status}" in
     running && { print "已在生效中 (pid $(<$PIDF))"; exit 0 }
     allow=()
     [[ -f $CONF ]] && allow=(${(f)"$(grep -vE '^\s*(#|$)' $CONF)"})
+    # 拒绝名单:优先级最高,堵住键盘增强工具重发物理输入的路径
+    deny=()
+    if [[ -f $DENY ]]; then
+      for d in ${(f)"$(grep -vE '^\s*(#|$)' $DENY)"}; do deny+=(--deny "$d"); done
+    fi
     dim
-    $BLOCKER $secs $allow > $LOG 2>&1 &
+    $BLOCKER $secs $allow $deny > $LOG 2>&1 &
     bpid=$!
     print $bpid > $PIDF
     # 看门狗:阻断器无论因超时、热键、SIGTERM 还是崩溃退出,都恢复亮度。
@@ -138,11 +145,16 @@ print(r.get('IOConsoleUsers',[{}])[0].get('CGSSessionScreenIsLocked','False'))
     [[ -f $CONF ]] && grep -vE '^\s*(#|$)' $CONF | while read -r p; do
       print "  [$(pgrep -f "$p" 2>/dev/null | wc -l | tr -d ' ') 个进程] $p"
     done
+    print "拒绝名单(优先级最高):"
+    [[ -f $DENY ]] && grep -vE '^\s*(#|$)' $DENY | while read -r d; do
+      print "  [$(pgrep -f "$d" 2>/dev/null | wc -l | tr -d ' ') 个进程] ${d:t}"
+    done
     print "显示器:"
     for i in ${(f)"$(display_ids)"}; do
       print "  displayID=$i brightness=$(timeout 10 $BD get -displayID=$i -brightness 2>/dev/null | tr -d '\n')"
     done
     ;;
   allow) ${EDITOR:-vi} $CONF ;;
-  *) print "用法: curtain {on [秒]|off|status|allow}" >&2; exit 2 ;;
+  deny)  ${EDITOR:-vi} $DENY ;;
+  *) print "用法: curtain {on [秒]|off|status|allow|deny}" >&2; exit 2 ;;
 esac

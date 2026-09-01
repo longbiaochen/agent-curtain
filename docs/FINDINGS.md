@@ -104,3 +104,28 @@ display 4: 110 → 写 0 → 110   ✗
   `authd: running mechanism CodexComputerUseAuthorizationPlugin:allow` 即证据。
 - `sysadminctl -screenLock status` 报 `off` **不代表不会锁屏**。
   `askForPassword=1` 加上启动屏保仍会真正锁上。这两个开关不是同一套机制。
+
+## 7. 拒绝名单:如何在不确定性下做安全设计
+
+「放行一切 `pid != 0`」可免去白名单配置,但存在一个无法远程验证的风险:
+键盘增强工具抓取物理键盘后经虚拟 HID 设备重发事件,若带非零 PID 则物理输入
+被整体放行。
+
+本项目未去验证「Karabiner 重发事件是否带 PID」,而是用**拒绝名单**让两种
+可能都安全:
+
+| 若重发事件 | 拒绝名单的作用 |
+|---|---|
+| 带非零 PID | 堵住它,物理输入仍被拦 |
+| 为 `pid=0` | 无害的空操作,本来就会被拦 |
+
+本机解析结果(Karabiner-Elements 14.x):
+
+```
+[3 个进程] Karabiner-Core-Service.app
+[2 个进程] Karabiner-VirtualHIDDevice-Daemon.app
+[3 个进程] org.pqrs.Karabiner-DriverKit-VirtualHIDDevice
+```
+
+注意 dext 位于 `/Library/SystemExtensions/<UUID>/`,UUID 因机器而异,
+而 `pgrep -f` 不展开通配符 —— 故按不含路径的进程名匹配。

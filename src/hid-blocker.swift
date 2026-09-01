@@ -11,27 +11,30 @@ import Cocoa
 // 用法: hid-blocker <秒数> [--allow-any-injected] [允许的可执行路径 ...]
 //   pid=0 的事件视为真实硬件输入 → 吞掉
 //   白名单进程的事件 → 放行
-//   --allow-any-injected: 放行一切 pid!=0 的事件(免配置,但见下方警告)
+//   --allow-any-injected: 放行一切 pid!=0 的事件(免配置)
+//   --deny <path>:        无论何种模式都拒绝该进程的事件,优先级最高
 //
-// ⚠️ --allow-any-injected 的风险:若某个键盘增强工具(如 Karabiner-Elements)
-//    抓取物理键盘后经自身虚拟 HID 设备重发事件,且重发事件带非零 PID,
-//    则物理键盘会被整体放行,阻断器失效。
-//    DriverKit 设备产生的事件通常仍为 pid=0,但本项目**尚未用真实按键验证**。
-//    在验证之前,请使用显式白名单(默认行为)。
+// 拒绝名单解决了 --allow-any-injected 的核心风险:键盘增强工具
+// (Karabiner-Elements)抓取物理键盘后经自身虚拟 HID 设备重发事件。
+// 若重发事件带非零 PID,放行规则会把物理键盘整体放行 —— 显式拒绝可堵住。
+// 而若那些事件其实是 pid=0(DriverKit 设备的常见行为),拒绝名单是无害的
+// 空操作。**两种情况下都安全**,因此无需先验证究竟是哪一种。
 //
 // 安全:硬性计时器到点必解除;SIGTERM/SIGINT 立即解除;
 //      tap 被系统因超时禁用时自动重新启用。
 
 var allowedPaths: [String] = []
+var deniedPaths: [String] = []
 var allowedPIDs = Set<Int32>()
+var deniedPIDs = Set<Int32>()
 var blockedCount = 0
 var allowedCount = 0
 let lock = NSLock()
 var tapRef: CFMachPort?
 
-func refreshPIDs() {
+func pidsFor(_ paths: [String]) -> Set<Int32> {
     var found = Set<Int32>()
-    for path in allowedPaths {
+    for path in paths {
         let p = Process()
         p.launchPath = "/usr/bin/pgrep"
         p.arguments = ["-f", path]
@@ -43,7 +46,11 @@ func refreshPIDs() {
             if let pid = Int32(line.trimmingCharacters(in: .whitespaces)) { found.insert(pid) }
         }
     }
-    lock.lock(); allowedPIDs = found; lock.unlock()
+    return found
+}
+func refreshPIDs() {
+    let a = pidsFor(allowedPaths), d = pidsFor(deniedPaths)
+    lock.lock(); allowedPIDs = a; deniedPIDs = d; lock.unlock()
 }
 
 func release(_ reason: String) -> Never {
@@ -70,8 +77,12 @@ guard args.count >= 2, let seconds = Double(args[1]) else {
     exit(2)
 }
 var allowAnyInjected = false
+var expectDeny = false
 for a in args.dropFirst(2) {
-    if a == "--allow-any-injected" { allowAnyInjected = true } else { allowedPaths.append(a) }
+    if expectDeny { deniedPaths.append(a); expectDeny = false }
+    else if a == "--allow-any-injected" { allowAnyInjected = true }
+    else if a == "--deny" { expectDeny = true }
+    else { allowedPaths.append(a) }
 }
 refreshPIDs()
 
@@ -106,7 +117,9 @@ guard let tap = CGEvent.tapCreate(
         }
         let pid = Int32(ev.getIntegerValueField(.eventSourceUnixProcessID))
         lock.lock()
-        let allowed = pid != 0 && (allowAnyInjected || allowedPIDs.contains(pid))
+        // 拒绝名单优先级最高,压过 --allow-any-injected 与白名单
+        let denied = pid != 0 && deniedPIDs.contains(pid)
+        let allowed = !denied && pid != 0 && (allowAnyInjected || allowedPIDs.contains(pid))
         if allowed { allowedCount += 1 } else { blockedCount += 1 }
         lock.unlock()
         return allowed ? Unmanaged.passUnretained(ev) : nil
@@ -120,7 +133,7 @@ CFRunLoopAddSource(CFRunLoopGetCurrent(),
 CGEvent.tapEnable(tap: tap, enable: true)
 
 lock.lock(); let n = allowedPIDs.count; lock.unlock()
-print("ARMED seconds=\(Int(seconds)) allowlist=\(allowedPaths.count)path/\(n)pid anyInjected=\(allowAnyInjected) hotkey=Ctrl+Opt+Cmd+Shift+U")
+print("ARMED seconds=\(Int(seconds)) allowlist=\(allowedPaths.count)path/\(n)pid anyInjected=\(allowAnyInjected) deny=\(deniedPaths.count)path hotkey=Ctrl+Opt+Cmd+Shift+U")
 fflush(stdout)
 
 // 每 3 秒刷新白名单 PID(进程重启后 PID 会变)

@@ -1,0 +1,13 @@
+# curtain 拒绝名单 —— 这些进程的事件**永远**被拦下,
+# 优先级高于白名单和 --allow-any-injected。
+#
+# 为什么需要:键盘增强工具会抓取物理键盘、再经自身虚拟 HID 设备重发事件。
+# 若重发事件带非零 PID,「放行一切 pid!=0」就会把物理键盘整体放行,
+# 阻断器失效。显式拒绝可堵住这个洞;而若那些事件其实是 pid=0,
+# 本名单是无害的空操作 —— 两种情况下都安全。
+
+/Library/Application Support/org.pqrs/Karabiner-Elements/Karabiner-Core-Service.app
+/Library/Application Support/org.pqrs/Karabiner-DriverKit-VirtualHIDDevice/Applications/Karabiner-VirtualHIDDevice-Daemon.app
+# dext 在 /Library/SystemExtensions/<UUID>/ 下,UUID 因机器而异。
+# pgrep -f 不展开通配符,故直接用不含路径的进程名匹配。
+org.pqrs.Karabiner-DriverKit-VirtualHIDDevice
