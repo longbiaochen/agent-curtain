@@ -2,39 +2,208 @@
 set -euo pipefail
 
 MODE="${1:-run}"
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="$ROOT_DIR/build"
-mkdir -p "$BUILD_DIR"
+APP_NAME="AgentCurtain"
+BUNDLE_ID="com.longbiaochen.AgentCurtain"
+SIGNING_IDENTITY="${CURTAIN_SIGNING_IDENTITY:-Developer ID Application: LONGBIAO CHEN (HJG65XBC25)}"
+MIN_SYSTEM_VERSION="26.0"
+BUILD_CONFIGURATION="${CURTAIN_BUILD_CONFIGURATION:-release}"
 
-# 这是输入阻断工具；构建入口绝不能为了“重启应用”而终止已生效的安全状态。
-zsh -n "$ROOT_DIR/bin/curtain" "$ROOT_DIR/bin/curtain-watchdog" "$ROOT_DIR/install.sh"
-swiftc -O "$ROOT_DIR/src/hid-blocker.swift" -o "$BUILD_DIR/hid-blocker"
-swiftc -O "$ROOT_DIR/src/curtain-banner.swift" -o "$BUILD_DIR/curtain-banner"
-install -m 755 "$ROOT_DIR/bin/curtain" "$BUILD_DIR/curtain"
-install -m 755 "$ROOT_DIR/bin/curtain-watchdog" "$BUILD_DIR/curtain-watchdog"
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DIST_DIR="$ROOT_DIR/dist"
+DIST_APP="$DIST_DIR/$APP_NAME.app"
+STAGE_DIR="${TMPDIR:-/tmp}/agent-curtain-build-$(id -u)"
+APP_BUNDLE="$STAGE_DIR/$APP_NAME.app"
+APP_CONTENTS="$APP_BUNDLE/Contents"
+APP_MACOS="$APP_CONTENTS/MacOS"
+INFO_PLIST="$APP_CONTENTS/Info.plist"
+INSTALLED_APP="/Applications/$APP_NAME.app"
+SOCKET_PATH="$HOME/.local/state/curtain/control.sock"
+
+case "$MODE" in
+  run|--debug|debug|--logs|logs|--telemetry|telemetry|--verify|verify|--install|install) ;;
+  *)
+    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify|--install]" >&2
+    exit 2
+    ;;
+esac
+
+stop_running_app() {
+  if [[ -S "$SOCKET_PATH" ]]; then
+    python3 -c 'import socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(30); s.connect(sys.argv[1]); s.sendall(b"quit\n"); s.shutdown(socket.SHUT_WR); s.recv(4096); s.close()' "$SOCKET_PATH" 2>/dev/null || true
+  fi
+  for _ in {1..50}; do
+    [[ -S "$SOCKET_PATH" ]] || return 0
+    sleep 0.1
+  done
+  echo "$APP_NAME did not remove its control socket" >&2
+  return 1
+}
+
+stage_bundle() {
+  swift build -c "$BUILD_CONFIGURATION"
+  local bin_dir
+  bin_dir="$(swift build -c "$BUILD_CONFIGURATION" --show-bin-path)"
+
+  rm -rf "$APP_BUNDLE"
+  mkdir -p "$APP_MACOS"
+  install -m 755 "$bin_dir/AgentCurtain" "$APP_MACOS/AgentCurtain"
+  install -m 755 "$bin_dir/AgentCurtainRestoreWatchdog" "$APP_MACOS/AgentCurtainRestoreWatchdog"
+
+  plutil -create xml1 "$INFO_PLIST"
+  plutil -insert CFBundleExecutable -string "$APP_NAME" "$INFO_PLIST"
+  plutil -insert CFBundleIdentifier -string "$BUNDLE_ID" "$INFO_PLIST"
+  plutil -insert CFBundleName -string "$APP_NAME" "$INFO_PLIST"
+  plutil -insert CFBundleDisplayName -string "$APP_NAME" "$INFO_PLIST"
+  plutil -insert CFBundlePackageType -string APPL "$INFO_PLIST"
+  plutil -insert CFBundleShortVersionString -string 1.0.0 "$INFO_PLIST"
+  plutil -insert CFBundleVersion -string "$(git -C "$ROOT_DIR" rev-list --count HEAD)" "$INFO_PLIST"
+  plutil -insert LSMinimumSystemVersion -string "$MIN_SYSTEM_VERSION" "$INFO_PLIST"
+  plutil -insert LSUIElement -bool true "$INFO_PLIST"
+  plutil -insert NSPrincipalClass -string NSApplication "$INFO_PLIST"
+  /usr/bin/xattr -cr "$APP_BUNDLE"
+  /usr/bin/xattr -d com.apple.FinderInfo "$APP_BUNDLE" 2>/dev/null || true
+  /usr/bin/xattr -d 'com.apple.fileprovider.fpfs#P' "$APP_BUNDLE" 2>/dev/null || true
+}
+
+publish_dist_copy() {
+  rm -rf "$DIST_APP"
+  mkdir -p "$DIST_DIR"
+  /usr/bin/ditto --norsrc "$APP_BUNDLE" "$DIST_APP"
+  /usr/bin/xattr -cr "$DIST_APP" 2>/dev/null || true
+}
+
+sign_bundle() {
+  security find-identity -v -p codesigning | grep -Fq "\"$SIGNING_IDENTITY\"" || {
+    echo "required signing identity is unavailable: $SIGNING_IDENTITY" >&2
+    exit 1
+  }
+  clean_bundle_metadata
+  codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_MACOS/AgentCurtain"
+  clean_bundle_metadata
+  codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_MACOS/AgentCurtainRestoreWatchdog"
+  clean_bundle_metadata
+  codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_BUNDLE"
+  clean_bundle_metadata
+  codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+
+  local requirement
+  requirement="$(codesign -d -r- "$APP_BUNDLE" 2>&1)"
+  grep -q 'anchor apple generic' <<<"$requirement" || {
+    echo "designated requirement is not anchored to Apple Developer ID" >&2
+    echo "$requirement" >&2
+    exit 1
+  }
+  if grep -q 'cdhash' <<<"$requirement"; then
+    echo "designated requirement unexpectedly contains cdhash" >&2
+    echo "$requirement" >&2
+    exit 1
+  fi
+  publish_dist_copy
+}
+
+clean_bundle_metadata() {
+  /usr/bin/xattr -cr "$APP_BUNDLE"
+  while IFS= read -r path; do
+    /usr/bin/xattr -d com.apple.FinderInfo "$path" 2>/dev/null || true
+    /usr/bin/xattr -d com.apple.ResourceFork "$path" 2>/dev/null || true
+    /usr/bin/xattr -d 'com.apple.fileprovider.fpfs#P' "$path" 2>/dev/null || true
+    /usr/bin/xattr -d com.apple.provenance "$path" 2>/dev/null || true
+  done < <(find "$APP_BUNDLE" -print)
+}
+
+launch_and_wait() {
+  local app_path=$1
+  /usr/bin/open -n "$app_path"
+  for _ in {1..100}; do
+    if [[ -S "$SOCKET_PATH" ]]; then
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "$APP_NAME did not create $SOCKET_PATH" >&2
+  return 1
+}
+
+install_artifacts() {
+  if [[ -f "$HOME/.local/state/curtain/brightness.bak" ]] \
+     && [[ -x "$HOME/.local/bin/curtain" ]] \
+     && grep -q 'BLOCKER=' "$HOME/.local/bin/curtain"; then
+    "$HOME/.local/bin/curtain" off
+    [[ ! -f "$HOME/.local/state/curtain/brightness.bak" ]] || {
+      echo "legacy curtain brightness restore did not finish; refusing migration" >&2
+      exit 1
+    }
+  fi
+  stop_running_app
+  rm -rf "$INSTALLED_APP"
+  /usr/bin/ditto "$APP_BUNDLE" "$INSTALLED_APP"
+  codesign --verify --deep --strict --verbose=2 "$INSTALLED_APP"
+
+  mkdir -p "$HOME/.local/bin" "$HOME/.config/curtain" "$HOME/.local/state/curtain"
+  chmod 700 "$HOME/.config/curtain" "$HOME/.local/state/curtain"
+  install -m 755 "$ROOT_DIR/bin/curtain" "$HOME/.local/bin/curtain"
+  [[ -f "$HOME/.config/curtain/allowlist" ]] || install -m 600 "$ROOT_DIR/examples/allowlist" "$HOME/.config/curtain/allowlist"
+  [[ -f "$HOME/.config/curtain/denylist" ]] || install -m 600 "$ROOT_DIR/examples/denylist" "$HOME/.config/curtain/denylist"
+
+  if [[ -w /usr/local/bin ]]; then
+    install -m 755 "$ROOT_DIR/bin/curtain" /usr/local/bin/curtain
+  elif [[ -w /usr/local/bin/curtain ]]; then
+    /bin/cp "$ROOT_DIR/bin/curtain" /usr/local/bin/curtain
+    chmod 755 /usr/local/bin/curtain
+  elif sudo -n true >/dev/null 2>&1; then
+    sudo -n install -m 755 "$ROOT_DIR/bin/curtain" /usr/local/bin/curtain
+  else
+    echo "warning: /usr/local/bin/curtain could not be updated without interactive sudo; ~/.local/bin/curtain is current" >&2
+  fi
+  launch_and_wait "$INSTALLED_APP"
+
+  launchctl bootout "gui/$(id -u)/me.longbiaochen.curtain-sentry" >/dev/null 2>&1 || true
+  rm -f \
+    "$HOME/.local/libexec/hid-blocker" \
+    "$HOME/.local/libexec/curtain-banner" \
+    "$HOME/.local/libexec/curtain-watchdog" \
+    "$HOME/.local/libexec/curtain-sentry" \
+    "$HOME/Library/LaunchAgents/me.longbiaochen.curtain-sentry.plist"
+  echo "retired legacy hid-blocker, curtain-banner, watchdog, and sentry installation"
+}
+
+stop_running_app
+stage_bundle
+sign_bundle
 
 case "$MODE" in
   run)
-    "$BUILD_DIR/curtain" status
+    launch_and_wait "$APP_BUNDLE"
     ;;
   --debug|debug)
-    lldb -- /bin/zsh "$BUILD_DIR/curtain" status
+    lldb -- "$APP_MACOS/AgentCurtain"
     ;;
   --logs|logs)
-    tail -n 50 -F "$HOME/.local/state/curtain/blocker.log" "$HOME/.local/state/curtain/watchdog.log"
+    launch_and_wait "$APP_BUNDLE"
+    /usr/bin/log stream --info --style compact --predicate 'process == "AgentCurtain"'
     ;;
   --telemetry|telemetry)
-    /usr/bin/log stream --info --style compact --predicate 'process == "hid-blocker" OR process == "curtain-banner"'
+    launch_and_wait "$APP_BUNDLE"
+    /usr/bin/log stream --info --style compact --predicate 'subsystem == "com.longbiaochen.AgentCurtain" OR process == "AgentCurtain"'
     ;;
   --verify|verify)
-    codesign --verify --strict --verbose=2 "$BUILD_DIR/hid-blocker"
-    codesign --verify --strict --verbose=2 "$BUILD_DIR/curtain-banner"
-    "$BUILD_DIR/curtain" status >/dev/null
-    "$ROOT_DIR/tests/watchdog-smoke.zsh"
-    echo "verify: shell syntax, Swift builds, code signatures, safe status launch, and watchdog restore passed"
+    swift test
+    "$ROOT_DIR/tests/banner-lifetime.zsh"
+    "$ROOT_DIR/tests/watchdog-integration.zsh"
+    launch_and_wait "$APP_BUNDLE"
+    python3 -c 'import json,os,socket,stat,sys
+path=sys.argv[1]
+mode=stat.S_IMODE(os.stat(path).st_mode)
+assert mode == 0o600, oct(mode)
+s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(path); s.sendall(b"status\n"); s.shutdown(socket.SHUT_WR)
+response=json.loads(s.recv(4096)); assert response["ok"] is True; assert response["state"] == "open", response
+print("verify: signed app launched; control.sock is 0600; status protocol returned open")' "$SOCKET_PATH"
     ;;
-  *)
-    echo "usage: $0 [run|--debug|--logs|--telemetry|--verify]" >&2
-    exit 2
+  --install|install)
+    install_artifacts
+    python3 -c 'import json,socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1]); s.sendall(b"status\n"); s.shutdown(socket.SHUT_WR)
+r=json.loads(s.recv(4096)); assert r["ok"] is True; print("installed status:", json.dumps(r, ensure_ascii=False, sort_keys=True))' "$SOCKET_PATH"
     ;;
 esac

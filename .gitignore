@@ -1,3 +1,6 @@
 .DS_Store
 *.o
 build/
+.build/
+.swiftpm/
+dist/

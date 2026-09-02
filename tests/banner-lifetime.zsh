@@ -37,19 +37,10 @@ print -r -- "$new_out" | grep -q '仍存活' || {
   print -u2 "$new_out"; exit 1
 }
 
-# 3. 装好的提示条源码必须真的设了这一项
-grep -q 'isReleasedWhenClosed = false' "$root/src/curtain-banner.swift" || {
-  print -u2 "banner-lifetime: src/curtain-banner.swift 没有设置 isReleasedWhenClosed = false"
+# 3. 正式 app 的提示条实现必须真的设了这一项
+grep -q 'isReleasedWhenClosed = false' "$root/Sources/AgentCurtain/BannerController.swift" || {
+  print -u2 "banner-lifetime: BannerController 没有设置 isReleasedWhenClosed = false"
   exit 1
-}
-
-# 4. 重建路径冒烟:反复触发屏幕参数变化，窗口数须与屏幕数一致且不崩
-swiftc -O "$root/src/curtain-banner.swift" -o "$probe/banner" 2>/dev/null
-smoke=$(CURTAIN_BANNER_SELFTEST=8 "$probe/banner" 2>&1) || {
-  print -u2 "banner-lifetime: 重建路径冒烟崩溃"; print -u2 "$smoke"; exit 1
-}
-print -r -- "$smoke" | grep -q 'SELFTEST PASS' || {
-  print -u2 "banner-lifetime: 重建冒烟没有跑完"; print -u2 "$smoke"; exit 1
 }
 
 print "banner-lifetime: passed"

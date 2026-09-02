@@ -1,0 +1,3 @@
+#!/bin/zsh
+set -eu
+print -r -- "$*" >> "$CURTAIN_FAKE_BETTERDISPLAY_LOG"
