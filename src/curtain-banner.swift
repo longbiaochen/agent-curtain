@@ -7,21 +7,52 @@ import Cocoa
 
 class Banner: NSObject, NSApplicationDelegate {
     var windows: [NSWindow] = []
+
     func applicationDidFinishLaunching(_ n: Notification) {
-        for screen in NSScreen.screens { make(on: screen) }
+        rebuild()
         NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
-            object: nil, queue: .main) { _ in
-                self.windows.forEach { $0.close() }; self.windows.removeAll()
-                for s in NSScreen.screens { self.make(on: s) }
-            }
+            object: nil, queue: .main) { [weak self] _ in self?.rebuild() }
+        selfTestIfRequested()
     }
-    func make(on screen: NSScreen) {
+
+    // 屏幕数没变时只挪位置,不销毁窗口。
+    // 销毁路径才是 2026-09-02 那次崩溃的现场(AppKit 在 CA 事务里
+    // 释放窗口的过渡动画),而分辨率变化、显示器睡醒这类最常见的
+    // 屏幕参数变化根本不需要重建窗口。
+    func rebuild() {
+        let screens = NSScreen.screens
+        while windows.count > screens.count {
+            let extra = windows.removeLast()
+            extra.orderOut(nil)
+            extra.close()
+        }
+        for (index, screen) in screens.enumerated() {
+            if index < windows.count {
+                windows[index].setFrame(frame(on: screen), display: true)
+            } else {
+                windows.append(make(on: screen))
+            }
+        }
+    }
+
+    func frame(on screen: NSScreen) -> NSRect {
         let w: CGFloat = 560, h: CGFloat = 44
         let f = screen.frame
-        let rect = NSRect(x: f.midX - w/2, y: f.maxY - h - 12, width: w, height: h)
+        return NSRect(x: f.midX - w/2, y: f.maxY - h - 12, width: w, height: h)
+    }
+
+    @discardableResult
+    func make(on screen: NSScreen) -> NSWindow {
+        let w: CGFloat = 560, h: CGFloat = 44
+        let rect = frame(on: screen)
         let win = NSWindow(contentRect: rect, styleMask: .borderless,
                            backing: .buffered, defer: false)
+        // 关键:NSWindow 默认 isReleasedWhenClosed = true。close() 会自己
+        // 释放窗口一次,而 windows 数组里的强引用被 ARC 释放时又是一次 ——
+        // 双重释放,崩在后面某次 autorelease pool pop 里(2026-09-02 11:18:50,
+        // EXC_BAD_ACCESS @ -[_NSWindowTransformAnimation dealloc])。
+        win.isReleasedWhenClosed = false
         win.level = .screenSaver
         win.isOpaque = false
         win.backgroundColor = .clear
@@ -45,7 +76,29 @@ class Banner: NSObject, NSApplicationDelegate {
         box.addSubview(label)
         win.contentView = box
         win.orderFrontRegardless()
-        windows.append(win)
+        return win
+    }
+
+    // 重建路径的冒烟钩子:
+    //   CURTAIN_BANNER_SELFTEST=<次数> curtain-banner
+    // 把 didChangeScreenParameters 发 <次数> 遍,每遍转一次 runloop 让 CA 事务
+    // 提交完,验证窗口数始终等于屏幕数且不崩。
+    // 注意:合成的通知**不会**复现 2026-09-02 那次崩溃 —— 那需要真实的显示器
+    // 重配置才会让 AppKit 建出 _NSWindowTransformAnimation。双重释放本身由
+    // tests/banner-lifetime.zsh 用 weak 引用确定性地证明。
+    func selfTestIfRequested() {
+        guard let raw = ProcessInfo.processInfo.environment["CURTAIN_BANNER_SELFTEST"],
+              let rounds = Int(raw), rounds > 0 else { return }
+        DispatchQueue.main.async {
+            for round in 1...rounds {
+                NotificationCenter.default.post(
+                    name: NSApplication.didChangeScreenParametersNotification, object: NSApp)
+                RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+                FileHandle.standardError.write("selftest round \(round)/\(rounds) ok windows=\(self.windows.count)\n".data(using: .utf8)!)
+            }
+            FileHandle.standardError.write("SELFTEST PASS\n".data(using: .utf8)!)
+            exit(0)
+        }
     }
 }
 let app = NSApplication.shared

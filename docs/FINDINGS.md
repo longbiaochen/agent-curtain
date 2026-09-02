@@ -259,3 +259,41 @@ ssh → launchctl submit   ARMED ✅
   agent 时它永远是 0。告警出口 `CURTAIN_ALERT_CMD` 可接推送。
 - 运维守则:**只从已授权的 Terminal.app 启用 curtain,不从 agent 会话启用。**
 
+## 10. 提示条崩溃:NSWindow 的 isReleasedWhenClosed
+
+2026-09-02 11:18:50,`curtain-banner` 崩了:
+
+```
+EXC_BAD_ACCESS (SIGSEGV)  objc_release
+  ← -[_NSWindowTransformAnimation dealloc]
+  ← CA::Context::commit_transaction
+```
+
+崩溃前一条日志是 `AppKit:Screen NSApplication._react(to:) reactions=83`
+—— 显示器重配置。`~/Library/Logs/DiagnosticReports/` 里同款报告共 4 份
+(09-01 18:08 / 22:53 / 23:19,09-02 11:18),是复发性缺陷,不是偶发。
+
+**根因:`NSWindow` 的 `isReleasedWhenClosed` 默认是 `true`。**
+屏幕参数变化时提示条做 `windows.forEach { $0.close() }` 再 `removeAll()`:
+`close()` 释放一次,数组的强引用被 ARC 释放时又一次 —— 双重释放。
+崩溃点落在之后某次 autorelease pool 排空里,所以现场离案发点很远。
+
+确定性验证(`tests/banner-lifetime.zsh`):用 weak 引用做判据,
+数组仍持有窗口而 weak 被清零,即为提前释放。
+
+```
+isReleasedWhenClosed=true    close() 后 weak 已被清零 —— 悬垂引用   → 退出码 139
+isReleasedWhenClosed=false   close() 后 weak 仍存活                → 退出码 0
+```
+
+**注意合成的 `didChangeScreenParametersNotification` 复现不出这次崩溃**
+(实测发 8 遍,旧代码干净退出)—— `_NSWindowTransformAnimation` 只在真实的
+显示器重配置里才会被 AppKit 建出来。所以判据要用生命周期,不要用"多发几次通知"。
+
+修复两处:
+
+1. `win.isReleasedWhenClosed = false` —— 真正的缺陷。
+   (仓库里新的 `Sources/AgentCurtain/BannerController.swift` 本来就是对的。)
+2. 屏幕数没变时只 `setFrame` 挪位置,不销毁重建。分辨率变化、显示器睡醒
+   这类最常见的屏幕参数变化根本不需要重建窗口,顺带完全绕开了销毁路径。
+
