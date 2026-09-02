@@ -191,6 +191,9 @@ case "$MODE" in
     swift test
     "$ROOT_DIR/tests/banner-lifetime.zsh"
     "$ROOT_DIR/tests/watchdog-integration.zsh"
+    swiftc -typecheck -parse-as-library "$ROOT_DIR/script/verify_banner_framebuffer.swift" \
+      -framework CoreGraphics \
+      -framework ScreenCaptureKit
     launch_and_wait "$APP_BUNDLE"
     python3 -c 'import json,os,socket,stat,sys
 path=sys.argv[1]

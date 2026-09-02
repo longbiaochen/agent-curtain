@@ -9,7 +9,8 @@ Allowlisted remote-desktop processes and session-layer agent input continue to
 work.
 
 [中文说明](README.zh-CN.md) · [Measured findings](docs/FINDINGS.md) ·
-[Implementation PRD](docs/PRD-menubar-app.md)
+[Implementation PRD](docs/PRD-menubar-app.md) ·
+[Acceptance matrix](docs/ACCEPTANCE-menubar-app.md)
 
 > AgentCurtain is weaker than the real lock screen. It deters opportunistic
 > access; it does not protect against a prepared attacker, a reboot, new input
@@ -135,6 +136,15 @@ composition and blinds GUI agents.
 The Codex Run action points to the same script. `--verify` runs Swift tests,
 strict signature validation, launches the signed bundle, verifies socket mode
 0600, and checks the JSON status response.
+
+While the curtain is drawn, verify real banner rendering on every framebuffer:
+
+```bash
+./script/verify_banner_framebuffer.sh
+```
+
+This scans the rendered feature color per `CGDirectDisplayID`; a running banner
+process or a retained `NSWindow` is not accepted as proof.
 
 Hardware acceptance remains separate. In particular, a real person must press
 physical keys and use the mouse to prove the `blocked` counter rises without UI

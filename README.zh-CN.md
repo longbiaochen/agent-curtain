@@ -7,7 +7,8 @@ AgentCurtain 是面向 macOS 26+ 无人值守 GUI agent 会话的菜单栏应用
 继续合成画面。白名单内的远程桌面进程和 session 层的 agent 注入仍可正常工作。
 
 [English](README.md) · [实测记录](docs/FINDINGS.md) ·
-[实现 PRD](docs/PRD-menubar-app.md)
+[实现 PRD](docs/PRD-menubar-app.md) ·
+[验收矩阵](docs/ACCEPTANCE-menubar-app.md)
 
 > AgentCurtain 弱于真锁屏。它防的是路过同事、进屋访客等机会型接触，防不住
 > 有准备的攻击者、重启、插入新输入设备或物理拆机。UI 只会说“幕帘已拉上”，
@@ -124,6 +125,15 @@ framebuffer 合成，让 GUI agent 失明。
 
 Codex 的 Run 按钮也指向同一脚本。`--verify` 会运行 Swift 测试、严格验证签名、
 启动已签名 bundle、检查 socket 权限为 0600，并验证 JSON `status` 响应。
+
+幕帘拉上时，用下列命令逐块验证 framebuffer 中真的画出了提示条：
+
+```bash
+./script/verify_banner_framebuffer.sh
+```
+
+它按 `CGDirectDisplayID` 扫描实际渲染的特征色；仅仅看到提示条进程或 `NSWindow`
+仍存活不算通过。
 
 硬件验收必须单独进行。尤其是“物理键鼠确实无效”只能由真人按键/移动鼠标验证：
 应看到 `blocked` 上升且界面无响应。程序化注入到不了同一 HID 路径，不能替代这项
