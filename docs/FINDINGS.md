@@ -119,9 +119,17 @@ ssh → launchctl submit   ARMED ✅
 `Could not switch to audit session: Operation not permitted`;
 加 `sudo -u` 后归责链又变,仍然失败。
 
-因此 `curtain on` 内部使用 `launchctl submit`。安装脚本优先使用稳定的
-Developer ID Application 身份、Hardened Runtime 和时间戳；若只能 ad-hoc
-签名，重新编译后授权仍可能失效(旧授权行会留在 TCC.db 里,极易误判)。
+**2026-09-01 起改为直接 fork,不再用 `launchctl submit`**(commit `c63e631`)。
+理由是安全:走 launchd 要求给一个能吞掉全部物理输入的二进制常驻授权,
+而且任何能 ssh 进来的人都能启用它。直接 fork 把归责交回调用方,
+只有已授权的交互式终端能 `on`。代价见下面第 9 节 —— **`on` 的成败从此
+取决于调用方进程链此刻的授权状态**,而那不是一个稳定的东西。
+
+授权给 `hid-blocker` 自身这条路还有一个坑:系统设置里按路径添加的条目,
+`csreq` 钉的是 **cdhash**(实测 `cdhash H"02e7…"`),不是 Developer ID
+的 identifier+anchor。所以二进制内容一变条目就失配,而且**取消勾选再勾上
+不会刷新 csreq** —— 必须「−」删掉整条再「+」加回。失配时系统设置里
+看起来仍然是勾着的,极易误判。`curtain doctor` 现在会把新旧 cdhash 并排打出来。
 
 **但 `curtain off` 不需要任何权限** —— 它只是发 SIGTERM 加恢复亮度,
 任何终端、任何会话都能执行。这是"永远不会被锁在外面"的保证。
@@ -186,3 +194,68 @@ Developer ID Application 身份、Hardened Runtime 和时间戳；若只能 ad-h
 `curtain on` 只有在四屏调暗读回、阻断器和看门狗都成功后才报告生效；调光失败、
 阻断器失败或看门狗失败会回滚。`curtain off` 不依赖 TCC，并保留旧版本状态的恢复
 兼容路径。
+
+## 9. 事故复盘:2026-09-02,幕帘掉了近一小时没人知道
+
+### 现象
+
+`curtain on` 报 `FAIL: 缺少辅助功能授权`。同一时刻,那个会话的屏幕录制、
+文稿文件夹、完全磁盘访问也全部失效。机器主人在外地,四块屏亮着、会话解锁。
+
+### 一次错误的归因
+
+第一反应是"用户在系统设置里把授权重置了"—— `TCC.db` 的 mtime 恰好落在
+前一晚在系统设置里操作的时间。**这个结论是错的。** 查 `TCC.db` 发现授权
+一条都没少:
+
+| 条目 | auth | last_modified |
+|---|---|---|
+| `com.anthropic.claude-code` ScreenCapture | 2 | 2026-08-06 |
+| `com.anthropic.claude-code` SystemPolicyAllFiles | 2 | 2026-08-31 |
+
+这两行当天根本没被改过,但当时 `screencapture` 和读 `TCC.db` 都失败。
+**授权在,是校验没过。**
+
+误判的直接原因是诊断时用了 `2>/dev/null`:`sqlite3` 的
+`authorization denied` 被吞掉,空结果被当成"表被清空了"。
+查权限问题时不要吞 stderr。
+
+### 真正的原因
+
+那个 agent 会话的 TCC 责任 bundle 是版本化的 helper:
+
+```
+~/Library/Application Support/Claude/claude-code/2.1.247/claude.app
+```
+
+当天 09:33 客户端自动升级到 2.1.255,**把 2.1.247 整个目录删了**
+(该目录 mtime 与升级时刻吻合,升级后只剩当前版本)。正在运行的会话
+责任 bundle 路径悬空 → 校验失败 → 四项 TCC 能力**同时**失效。
+新开的会话不受影响。上游 issue: `anthropics/claude-code#50735`。
+
+这解释了为什么 `curtain on` 从 Terminal.app 走一直是好的
+(同日 09:33:51 的 tccd 日志里,责任=Terminal 的 hid-blocker 拿到了
+`kTCCServicePostEvent = 2`,tap 建起来了),从 agent 会话走却挂了。
+
+### 三个把小故障放大的设计问题
+
+1. **`doctor` 全绿但 `on` 会失败。** 它查依赖、名单、显示器、签名,
+   唯独不查"当前调用链有没有辅助功能授权"—— 而这是唯一会挂的东西。
+2. **`curtain on` 用 `: > $LOG` 截断日志**,把上一轮怎么结束的证据抹掉。
+   事后无法回答"幕帘是几点、被什么停掉的"。
+3. **没有任何东西盯着幕帘。** 它不是常驻服务,掉了没人知道,也没人拉回来。
+
+### 修复
+
+- `on` 在**调暗之前**做辅助功能预检,失败时打印 TCC 归责链并给出对策。
+  原来的失败路径是"四块屏黑掉 → 阻断器起不来 → 回滚",而回滚本身也可能失败。
+- `doctor` 增加:归责链、授权预检、安装物与 `install.sh` 清单的一致性、
+  ad-hoc 签名告警、`hid-blocker` 自身 TCC 条目的 cdhash 匹配。
+- 日志改轮转(`$LOG.1`),并新增 `last-run` 记录每一轮的开始与结束原因
+  (看门狗在阻断器意外退出时也会写)。
+- 新增 `curtain-sentry`:launchd 每 5 分钟检查一次,发现"声明过期望拉上、
+  但阻断器没在跑、且没有真锁屏"就告警。**判据用显式的期望标记,不用
+  `HIDIdleTime` 猜人在不在** —— 合成事件会刷新 idle,恰恰在无人值守跑
+  agent 时它永远是 0。告警出口 `CURTAIN_ALERT_CMD` 可接推送。
+- 运维守则:**只从已授权的 Terminal.app 启用 curtain,不从 agent 会话启用。**
+

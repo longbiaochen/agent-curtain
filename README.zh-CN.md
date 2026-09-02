@@ -135,6 +135,21 @@ fork,因此只有已授权的交互式终端能启用。
 **`curtain off` 完全不需要权限** —— 它只是发 `SIGTERM` 并恢复亮度。
 这个不对称正是「永远不会把自己锁在外面」的保证。
 
+归责到调用方的代价是:能不能启用,取决于调用方此刻的授权状态,而那不稳定。
+**从 Terminal.app 启用,不要从 agent 会话启用**(Claude Code、Codex 等):
+它们的责任 bundle 是 `~/Library/Application Support/` 下随版本变化的 helper,
+自动升级会删掉旧版本目录,于是**正在运行**的会话瞬间失去全部 TCC 能力 ——
+辅助功能、屏幕录制、文稿文件夹、完全磁盘访问 —— 而 `TCC.db` 里的授权本身
+一条没少。2026-09-02 的事故复盘见 [FINDINGS §9](docs/FINDINGS.md)。
+
+`curtain on` 现在会在调暗**之前**做这项预检,失败时打印归责链;
+`curtain doctor` 也会直接报出来。
+
+给 `hid-blocker` 自身授权是另一个坑:在系统设置里按路径添加的条目,
+`csreq` 钉的是 **cdhash**,不是 Developer ID 的 identifier+anchor。
+二进制一变条目就静默失配,而且取消勾选再勾上**不会**刷新 ——
+必须删掉整条再加回。失配时 `doctor` 会把新旧 cdhash 并排打出来。
+
 ## 6. 实验效果
 
 测量环境:MacBook Pro 18,4 / macOS 26.5.2 / 四显示器。
@@ -234,12 +249,18 @@ cd agent-curtain && ./install.sh
 (`brew install --cask betterdisplay`),可选 Karabiner-Elements 用于热键。
 
 请从**已持有辅助功能权限的交互式终端**启用(Terminal.app,或在远程桌面里
-打开的终端)。
+打开的终端),不要从 agent 会话启用 —— 原因见 5.4。
+
+`install.sh` 同时会加载 `curtain-sentry`:一个只读的 LaunchAgent,
+每 5 分钟检查一次「你要求拉上、但幕帘不在」并告警。它自己**不会**启用幕帘。
 
 ## 配置
 
 - `~/.config/curtain/allowlist` —— 其事件被放行的可执行文件路径
 - `~/.config/curtain/denylist` —— 永远拦下,优先级高于一切
+- `~/.config/curtain/sentry.conf` —— `CURTAIN_ALERT_CMD` 从 stdin 收到告警文本。
+  人不在本机时本机通知没用,把它接到能推到手机的东西上:
+  `CURTAIN_ALERT_CMD="curl -s -d @- https://ntfy.sh/<你的主题>"`
 
 agent 的事件走 session 层、从不到达 HID tap,因此**无需**列入。
 

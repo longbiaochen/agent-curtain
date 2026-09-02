@@ -160,6 +160,24 @@ already-authorized interactive terminal can arm.
 restores brightness. That asymmetry is the guarantee that you can never lock
 yourself out.
 
+The cost of attributing to the caller is that arming depends on the caller's
+permission state, which is not stable. **Arm from Terminal.app, never from an
+agent session** (Claude Code, Codex, and friends): their responsible bundle is
+a per-version helper under `~/Library/Application Support/`, and an auto-update
+deletes the old version directory, so a *running* session loses every TCC
+capability at once — Accessibility, Screen Recording, Documents, Full Disk
+Access — while the grants themselves stay intact in `TCC.db`. See
+[FINDINGS §9](docs/FINDINGS.md) for the 2026-09-02 incident.
+
+`curtain on` preflights this before dimming and prints the responsibility
+chain when it fails; `curtain doctor` reports it up front.
+
+Granting `hid-blocker` itself is a separate trap: a path-type entry added in
+System Settings pins a **cdhash**, not a Developer ID requirement. Change the
+binary and the entry silently stops matching — and unchecking/rechecking the
+box does *not* refresh it; you must remove the row and add it back. `doctor`
+prints both hashes when they diverge.
+
 ## 6. Evaluation
 
 Measured on MacBook Pro 18,4 / macOS 26.5.2 / four displays. Full data and
@@ -271,12 +289,21 @@ Requirements: macOS, Xcode Command Line Tools, [BetterDisplay](https://betterdis
 (`brew install --cask betterdisplay`), optionally Karabiner-Elements for hotkeys.
 
 Arm from an interactive terminal that already holds Accessibility permission
-(Terminal.app, or a terminal opened inside a remote-desktop session).
+(Terminal.app, or a terminal opened inside a remote-desktop session) — not from
+an agent session; see §5.4.
+
+`install.sh` also loads `curtain-sentry`, a read-only LaunchAgent that checks
+every 5 minutes for "you asked for the curtain, it isn't there" and alerts.
+It never arms the curtain by itself.
 
 ## Configuration
 
 - `~/.config/curtain/allowlist` — executable paths whose events pass through
 - `~/.config/curtain/denylist` — always blocked, overrides everything
+- `~/.config/curtain/sentry.conf` — `CURTAIN_ALERT_CMD` receives the alert on
+  stdin. A local notification is useless when you are away, so point this at
+  something that reaches your phone:
+  `CURTAIN_ALERT_CMD="curl -s -d @- https://ntfy.sh/<your-topic>"`
 
 Agent events travel the session layer and never reach the HID tap, so they
 do **not** need to be listed.

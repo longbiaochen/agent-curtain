@@ -1,0 +1,101 @@
+#!/bin/zsh
+# curtain-sentry —— 定期检查「幕帘该拉上却没拉上」并告警。
+#
+# 为什么需要:curtain 不是常驻服务,掉了没人知道。2026-09-02 它在一次
+# `curtain on` 失败后停了近一小时,而机器主人在外地 —— 四块屏亮着、会话解锁。
+#
+# 判据(三条同时成立才告警):
+#   1. 你声明过「幕帘应该是拉上的」—— `curtain on` 成功时置位,
+#      `curtain off` 清除。看门狗**不**清除:阻断器意外死掉时期望依然成立。
+#      这比猜「人在不在」准确得多 —— HIDIdleTime 会被 agent 注入的合成事件
+#      刷新,恰恰在无人值守跑 agent 时永远是 0。
+#   2. 阻断器没在跑
+#   3. 会话没有真锁屏(真锁了就不需要幕帘)
+#
+# 本脚本全程只读,不需要任何 TCC 授权,也绝不自动启用幕帘:
+# 启用会吞掉物理键鼠,不该由定时任务替人决定。
+set -u
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+
+STATE=$HOME/.local/state/curtain
+PIDF=$STATE/blocker.pid
+EXPECT=$STATE/expected
+LOG=$STATE/sentry.log
+STAMP=$STATE/sentry.last-alert
+CONF=$HOME/.config/curtain/sentry.conf
+
+# 可在 sentry.conf 里覆盖:
+#   CURTAIN_SENTRY_REPEAT_SECS 同一状态的重复告警间隔(默认 3600)
+#   CURTAIN_ALERT_CMD          告警命令,消息从 stdin 读入。
+#                              不设则只发本机通知 —— 人不在本机时看不到,
+#                              所以远程办公时务必设成能推到手机的东西,例如:
+#                                CURTAIN_ALERT_CMD='curl -s -d @- https://ntfy.sh/<你的主题>'
+CURTAIN_SENTRY_REPEAT_SECS=3600
+CURTAIN_ALERT_CMD=""
+[[ -f "$CONF" ]] && source "$CONF"
+
+mkdir -p "$STATE"
+
+blocker_running() {
+  local pid
+  [[ -f "$PIDF" ]] || return 1
+  pid=$(cat "$PIDF" 2>/dev/null) || return 1
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+screen_locked() {
+  python3 -c '
+import plistlib, subprocess, sys
+out = subprocess.run(["ioreg", "-n", "Root", "-d1", "-a"], capture_output=True).stdout
+data = plistlib.loads(out)
+root = data[0] if isinstance(data, list) else data
+sys.exit(0 if root.get("IOConsoleUsers", [{}])[0].get("CGSSessionScreenIsLocked") else 1)
+' 2>/dev/null
+}
+
+hid_idle_secs() {
+  ioreg -c IOHIDSystem -d 1 2>/dev/null |
+    awk -F' = ' '/HIDIdleTime/ { printf "%d\n", $2 / 1000000000; exit }'
+}
+
+log_line() { print -r -- "$(date '+%F %T') $*" >> "$LOG" }
+
+idle=$(hid_idle_secs)
+[[ -n "$idle" ]] || idle=0
+
+if [[ ! -f "$EXPECT" ]]; then
+  log_line "ok 未声明期望（最近一次是 curtain off）"
+  exit 0
+fi
+if blocker_running; then
+  log_line "ok 幕帘生效中"
+  exit 0
+fi
+if screen_locked; then
+  log_line "ok 已真锁屏，无需幕帘"
+  exit 0
+fi
+
+now=$(date +%s)
+last=0
+last=$(cat "$STAMP" 2>/dev/null)
+[[ "$last" =~ '^[0-9]+$' ]] || last=0
+if (( now - last < CURTAIN_SENTRY_REPEAT_SECS )); then
+  log_line "抑制 已在 $(( (now - last) / 60 )) 分钟前告警过"
+  exit 0
+fi
+
+expected_since=$(cat "$EXPECT" 2>/dev/null)
+message="curtain 掉了：你在 ${expected_since:-?} 拉上过幕帘，现在阻断器没在跑，
+屏幕亮着、会话解锁（物理输入空闲 $(( idle / 60 )) 分钟）。
+主机 $(hostname -s)，$(date '+%F %T')。
+拉上：从已授权的 Terminal.app 执行 curtain on"
+
+log_line "告警 期望拉上但未生效 idle=${idle}s"
+print -r -- "$now" > "$STAMP"
+
+if [[ -n "$CURTAIN_ALERT_CMD" ]]; then
+  print -r -- "$message" | eval "$CURTAIN_ALERT_CMD" >>"$LOG" 2>&1 ||
+    log_line "告警命令失败: $CURTAIN_ALERT_CMD"
+fi
+osascript -e 'display notification "期望拉上但阻断器没在跑，屏幕亮着" with title "curtain 掉了"' >/dev/null 2>&1

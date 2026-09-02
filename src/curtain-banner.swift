@@ -34,8 +34,10 @@ class Banner: NSObject, NSApplicationDelegate {
         box.layer?.backgroundColor = NSColor(calibratedRed: 0.75, green: 0.10, blue: 0.10, alpha: 0.92).cgColor
         box.layer?.cornerRadius = 10
 
-        let label = NSTextField(labelWithString:
-            "🔒 CURTAIN 幕帘已拉上 · 物理键鼠已阻断 · Ctrl+Opt+Cmd+Shift+U 解除")
+        // 文案可通过 CURTAIN_BANNER_TEXT 覆盖,便于本地化。
+        let text = ProcessInfo.processInfo.environment["CURTAIN_BANNER_TEXT"]
+            ?? "🔒 CURTAIN IS DRAWN · physical input blocked · Ctrl+Opt+Cmd+Shift+U to release"
+        let label = NSTextField(labelWithString: text)
         label.font = .systemFont(ofSize: 14, weight: .semibold)
         label.textColor = .white
         label.alignment = .center

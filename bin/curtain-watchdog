@@ -37,6 +37,10 @@ if [[ -f "$banner_pid_file" ]]; then
   kill -TERM "$(<"$banner_pid_file")" 2>/dev/null || true
 fi
 rm -f "$pid_file" "$banner_pid_file"
+# 记下这一轮是怎么结束的。阻断器自己退出时不会留痕，没有这条记录，
+# 下一次 `curtain on` 之后就再也查不出上一轮为什么停了。
+last_run="${pid_file:h}/last-run"
+print -r -- "$(date '+%F %T') OFF 阻断器 pid=$blocker_pid 退出，看门狗已恢复亮度 failed=$failed" >> "$last_run" 2>/dev/null || true
 if [[ "${CURTAIN_WATCHDOG_NOTIFY:-1}" == 1 ]]; then
   osascript -e 'display notification "已自动解除" with title "curtain"' >/dev/null 2>&1 || true
 fi
