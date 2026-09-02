@@ -51,3 +51,30 @@ import Testing
     try BrightnessBackupStore.relinquish(claimed, to: url)
     #expect(FileManager.default.fileExists(atPath: url.path))
 }
+
+@Test func expectationSurvivesUntilTheCurtainIsDeliberatelyOpened() throws {
+    let root = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("curtain-expectation-\(UUID().uuidString)")
+    let paths = CurtainPaths(home: root)
+    try paths.prepareDirectories()
+    let expectation = CurtainExpectation(paths: paths)
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    #expect(!expectation.isRecorded)
+
+    let moment = Date(timeIntervalSince1970: 1_772_000_000)
+    try expectation.record(at: moment)
+    #expect(expectation.isRecorded)
+    #expect(expectation.recordedAt.map { abs($0.timeIntervalSince(moment)) < 1 } == true)
+
+    // 重复记录是幂等的：拉上已经拉上的幕帘不应该让判据变化。
+    try expectation.record(at: moment)
+    #expect(expectation.isRecorded)
+
+    try expectation.clear()
+    #expect(!expectation.isRecorded)
+    #expect(expectation.recordedAt == nil)
+    // 清除不存在的意图不能报错 —— open 会在任何 phase 下被调用。
+    try expectation.clear()
+}
+

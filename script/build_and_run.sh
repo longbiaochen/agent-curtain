@@ -158,14 +158,23 @@ install_artifacts() {
   fi
   launch_and_wait "$INSTALLED_APP"
 
-  launchctl bootout "gui/$(id -u)/me.longbiaochen.curtain-sentry" >/dev/null 2>&1 || true
   rm -f \
     "$HOME/.local/libexec/hid-blocker" \
     "$HOME/.local/libexec/curtain-banner" \
     "$HOME/.local/libexec/curtain-watchdog" \
-    "$HOME/.local/libexec/curtain-sentry" \
-    "$HOME/Library/LaunchAgents/me.longbiaochen.curtain-sentry.plist"
-  echo "retired legacy hid-blocker, curtain-banner, watchdog, and sentry installation"
+    "$HOME/.local/libexec/hid-blocker.swift" \
+    "$HOME/.local/libexec/sg-banner.swift"
+  echo "retired legacy hid-blocker, curtain-banner, and watchdog installation"
+
+  # 看护跟着一起装。它是 app 之外的一双眼睛 —— 正是这个安装动作本身
+  # 在 2026-09-02 把幕帘拆掉、没装回去、也没有任何人被告知。
+  mkdir -p "$HOME/.local/libexec" "$HOME/Library/LaunchAgents" "$HOME/.local/state/curtain"
+  install -m 755 "$ROOT_DIR/bin/curtain-sentry" "$HOME/.local/libexec/curtain-sentry"
+  sentry_plist="$HOME/Library/LaunchAgents/me.longbiaochen.curtain-sentry.plist"
+  sed "s|__HOME__|$HOME|g" "$ROOT_DIR/examples/me.longbiaochen.curtain-sentry.plist" > "$sentry_plist"
+  launchctl bootout "gui/$(id -u)/me.longbiaochen.curtain-sentry" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$(id -u)" "$sentry_plist"
+  echo "installed curtain-sentry (launchd, every 5 min)"
 }
 
 stop_running_app

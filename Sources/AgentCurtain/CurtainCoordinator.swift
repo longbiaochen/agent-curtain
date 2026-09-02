@@ -14,6 +14,7 @@ final class CurtainCoordinator {
     private let blocker = InputBlocker()
     private let banners = BannerController()
     private let brightness: BrightnessController
+    private let expectation: CurtainExpectation
     private let worker = DispatchQueue(label: "com.longbiaochen.AgentCurtain.operations")
     private var configuration = CurtainConfiguration(allowedRules: [], deniedRules: [])
     private var autoOpenTimer: Timer?
@@ -28,6 +29,7 @@ final class CurtainCoordinator {
     init(paths: CurtainPaths) {
         self.paths = paths
         brightness = BrightnessController(paths: paths)
+        expectation = CurtainExpectation(paths: paths)
         blocker.onReleaseHotkey = { [weak self] in self?.open(completion: { _ in }) }
         banners.onScreensChanged = { [weak self] in self?.screensChanged() }
     }
@@ -117,6 +119,9 @@ final class CurtainCoordinator {
                         self.displayCount = count
                         self.since = Date()
                         self.phase = .drawn
+                        // 落盘,好让 curtain-sentry 在本进程消失后仍知道
+                        // 「幕帘本该是拉上的」。写失败不影响拉幕帘本身。
+                        try? self.expectation.record()
                         self.scheduleAutomaticOpen(after: duration)
                         self.changed()
                         completion(self.response(ok: true))
@@ -162,6 +167,9 @@ final class CurtainCoordinator {
         if phase == .opening { return }
 
         phase = .opening
+        // 主动拉开才清除意图。崩溃、被卸载、被替换都到不了这里 ——
+        // 那正是看护要认出来的情况。
+        try? expectation.clear()
         autoOpenTimer?.invalidate()
         autoOpenTimer = nil
         blocker.stop()

@@ -13,6 +13,8 @@ public struct CurtainPaths: Sendable {
     public var denylist: URL { configDirectory.appendingPathComponent("denylist") }
     public var controlSocket: URL { stateDirectory.appendingPathComponent("control.sock") }
     public var brightnessBackup: URL { stateDirectory.appendingPathComponent("brightness.json") }
+    /// 见 CurtainExpectation —— 外部看护靠它判断幕帘是不是掉了。
+    public var expectation: URL { stateDirectory.appendingPathComponent("expected") }
 
     public func prepareDirectories() throws {
         try FileManager.default.createDirectory(

@@ -1,0 +1,94 @@
+#!/bin/zsh
+# curtain-sentry —— 看住「你要求拉上,幕帘却不在」这件事。
+#
+# 为什么它必须在 AgentCurtain.app 之外:2026-09-02 那天幕帘掉了两次,
+# 两次都不是进程崩溃 ——
+#   · 一次是 curtain on 失败(TCC 归责断了)之后没人再管;
+#   · 一次是部署动作把整套栈退役了、没有重新拉上。
+# 两种情况下 app 都没法自我报告。所以判据留在磁盘(state/expected,
+# 由 app 在拉上时写、主动拉开时清),检查由一个独立的 launchd 任务做。
+#
+# 全程只读:不启动 app、不改状态,更不会替人把幕帘拉上 ——
+# 拉上会吞掉物理键鼠,不该由定时任务决定。
+set -u
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
+
+state_dir=$HOME/.local/state/curtain
+socket_path=$state_dir/control.sock
+expected=$state_dir/expected
+log=$state_dir/sentry.log
+stamp=$state_dir/sentry.last-alert
+conf=$HOME/.config/curtain/sentry.conf
+
+# 可在 sentry.conf 覆盖:
+#   CURTAIN_SENTRY_REPEAT_SECS 同一状态的重复告警间隔(默认 3600)
+#   CURTAIN_ALERT_CMD          告警命令,消息从 stdin 读入。不设则只发本机通知
+#                              —— 人不在本机时看不到,远程办公务必设成能推到
+#                              手机的东西,例如:
+#                                CURTAIN_ALERT_CMD="curl -s -d @- https://ntfy.sh/<主题>"
+CURTAIN_SENTRY_REPEAT_SECS=3600
+CURTAIN_ALERT_CMD=""
+[[ -f "$conf" ]] && source "$conf"
+
+mkdir -p "$state_dir"
+log_line() { print -r -- "$(date '+%F %T') $*" >> "$log" }
+
+# 直接连 socket 问状态。刻意不走 bin/curtain —— 它在 socket 不在时会
+# `open -gj` 把 app 拉起来,那会把「app 没了」这个故障掩盖掉。
+query_state() {
+  [[ -S "$socket_path" ]] || { print -r -- "unreachable"; return }
+  python3 -c '
+import json, socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX); s.settimeout(10); s.connect(sys.argv[1])
+    s.sendall(b"status\n"); s.shutdown(socket.SHUT_WR)
+    chunks = []
+    while True:
+        data = s.recv(4096)
+        if not data: break
+        chunks.append(data)
+    print(json.loads(b"".join(chunks).decode()).get("state") or "unknown")
+except Exception:
+    print("unreachable")
+' "$socket_path" 2>/dev/null || print -r -- "unreachable"
+}
+
+if [[ ! -f "$expected" ]]; then
+  log_line "ok 未声明期望（最近一次是 curtain off）"
+  exit 0
+fi
+
+state=$(query_state)
+if [[ "$state" == "drawn" ]]; then
+  log_line "ok 幕帘生效中"
+  exit 0
+fi
+
+if [[ "$state" == "unreachable" ]]; then
+  reason="AgentCurtain 控制端点不可达（app 没在跑，或整套安装被替换掉了）"
+else
+  reason="AgentCurtain 报告 state=$state，幕帘不在生效中"
+fi
+
+now=$(date +%s)
+last=$(cat "$stamp" 2>/dev/null)
+[[ "$last" =~ '^[0-9]+$' ]] || last=0
+if (( now - last < CURTAIN_SENTRY_REPEAT_SECS )); then
+  log_line "抑制 已在 $(( (now - last) / 60 )) 分钟前告警过（$reason）"
+  exit 0
+fi
+
+expected_since=$(cat "$expected" 2>/dev/null)
+message="curtain 掉了：你在 ${expected_since:-?} 拉上过幕帘，现在没有生效。
+$reason
+主机 $(hostname -s)，$(date '+%F %T')。
+拉上：curtain on"
+
+log_line "告警 $reason"
+print -r -- "$now" > "$stamp"
+
+if [[ -n "$CURTAIN_ALERT_CMD" ]]; then
+  print -r -- "$message" | eval "$CURTAIN_ALERT_CMD" >>"$log" 2>&1 ||
+    log_line "告警命令失败: $CURTAIN_ALERT_CMD"
+fi
+osascript -e 'display notification "你要求拉上，但幕帘不在生效中" with title "curtain 掉了"' >/dev/null 2>&1
