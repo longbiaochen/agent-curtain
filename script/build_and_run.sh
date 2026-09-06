@@ -175,6 +175,22 @@ install_artifacts() {
   launchctl bootout "gui/$(id -u)/me.longbiaochen.curtain-sentry" >/dev/null 2>&1 || true
   launchctl bootstrap "gui/$(id -u)" "$sentry_plist"
   echo "installed curtain-sentry (launchd, every 5 min)"
+
+  # 两个 app 都进登录项。2026-09-06 机器重启后 BetterDisplay 没回来,
+  # betterdisplaycli 静默失败,curtain on 死在「没有显示器」。app 现在会
+  # 按需拉它,但登录项能省掉那几秒,也让菜单栏图标一开机就在。
+  for app in /Applications/BetterDisplay.app "$INSTALLED_APP"; do
+    [[ -d "$app" ]] || continue
+    name=$(basename "$app" .app)
+    if osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null |
+         tr ',' '\n' | sed 's/^ *//' | grep -qx "$name"; then
+      echo "login item already present: $name"
+    elif osascript -e "tell application \"System Events\" to make login item at end with properties {path:\"$app\", hidden:true}" >/dev/null 2>&1; then
+      echo "added login item: $name"
+    else
+      echo "warning: could not add login item for $name (System Events automation permission?)" >&2
+    fi
+  done
 }
 
 stop_running_app

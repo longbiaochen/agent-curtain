@@ -94,8 +94,17 @@ case "${1:-status}" in
     if pgrep -xq BetterDisplay; then
       print '[ok] BetterDisplay.app is running'
     else
-      print '[warn] BetterDisplay.app is not running; curtain on will launch it (add it to Login Items to avoid the delay)'
+      print '[warn] BetterDisplay.app is not running; curtain on will launch it'
     fi
+    # 重启后两个 app 都得自己回来,否则又是 2026-09-06 那种静默失灵。
+    login_items=$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null | tr ',' '\n' | sed 's/^ *//')
+    for name in BetterDisplay AgentCurtain; do
+      if print -r -- "$login_items" | grep -qx "$name"; then
+        print "[ok] $name is a login item"
+      else
+        print "[warn] $name is not a login item; it will not come back after a reboot (rerun install)"
+      fi
+    done
     response=$(send_command status)
     permissions=$(stat -f '%Lp' "$socket_path")
     [[ "$permissions" == 600 ]] || { print -u2 "[fail] socket mode is $permissions"; exit 1; }
