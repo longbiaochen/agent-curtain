@@ -77,16 +77,14 @@ final class ControlServer {
     }
 
     private func serve(_ client: Int32) {
-        var data = Data()
-        var buffer = [UInt8](repeating: 0, count: 1024)
-        while data.count < 4096 {
-            let count = recv(client, &buffer, buffer.count, 0)
-            if count <= 0 { break }
-            data.append(buffer, count: count)
-            if data.contains(0x0A) { break }
-        }
-        guard let line = String(data: data, encoding: .utf8)?.split(separator: "\n", maxSplits: 1).first.map(String.init) else {
-            send(ControlResponse(ok: false, error: "command is not UTF-8"), to: client)
+        // 读行的细节(阻塞、超时、EAGAIN 不是 EOF)在 ControlLineReader 里,
+        // 那里有针对 2026-09-06 竞态的回归测试。
+        let line: String
+        switch ControlLineReader.readLine(from: client) {
+        case .success(let text):
+            line = text
+        case .failure(let failure):
+            send(ControlResponse(ok: false, error: failure.errorDescription), to: client)
             return
         }
         do {

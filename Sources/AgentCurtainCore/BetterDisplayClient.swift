@@ -40,6 +40,7 @@ public enum BetterDisplayError: Error, LocalizedError {
     case commandTimedOut
     case invalidDisplayList
     case invalidBrightness(Int)
+    case appNotRunning(String)
 
     public var errorDescription: String? {
         switch self {
@@ -48,14 +49,32 @@ public enum BetterDisplayError: Error, LocalizedError {
         case .commandTimedOut: return "betterdisplaycli timed out"
         case .invalidDisplayList: return "betterdisplaycli returned no display IDs"
         case .invalidBrightness(let id): return "invalid brightness for displayID=\(id)"
+        case .appNotRunning(let app):
+            return "BetterDisplay.app is not running (\(app)); betterdisplaycli answers nothing without it"
         }
     }
 }
 
 public struct BetterDisplayClient: Sendable {
     public let executable: URL
+    /// betterdisplaycli 只是个前端,BetterDisplay.app 不在时它什么都不回、
+    /// 退出码还是 0。2026-09-06 早上机器重启后 app 没跟着起来,`curtain on`
+    /// 就一直死在「没有显示器」上。所以拿不到显示器列表时,先把 app 拉起来再试。
+    public let application: URL?
+    /// 拉起 app 后最多等这么久让 CLI 通起来。
+    public let launchWait: TimeInterval
+    /// 真正把 app 拉起来的动作。默认 `open -gj`;测试里换成空操作,免得真去开东西。
+    public let launcher: @Sendable (URL) -> Void
 
-    public init(executable: URL? = nil) throws {
+    public static let defaultLauncher: @Sendable (URL) -> Void = { application in
+        _ = try? CommandRunner.run(URL(fileURLWithPath: "/usr/bin/open"), arguments: ["-gj", application.path], timeout: 10)
+    }
+
+    public init(executable: URL? = nil, application: URL? = URL(fileURLWithPath: "/Applications/BetterDisplay.app"),
+                launchWait: TimeInterval = 10, launcher: @escaping @Sendable (URL) -> Void = BetterDisplayClient.defaultLauncher) throws {
+        self.application = application
+        self.launchWait = launchWait
+        self.launcher = launcher
         if let executable {
             self.executable = executable
             return
@@ -71,7 +90,10 @@ public struct BetterDisplayClient: Sendable {
     }
 
     public func displayIDs() throws -> [Int] {
-        let result = try checked(["get", "--identifiers"])
+        var result = try checked(["get", "--identifiers"])
+        if result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            result = try displayIDsAfterLaunchingApp()
+        }
         let data = Data(result.stdout.utf8)
         let object: Any
         if let direct = try? JSONSerialization.jsonObject(with: data) {
@@ -111,6 +133,21 @@ public struct BetterDisplayClient: Sendable {
 
     public func setBrightness(displayID: Int, value: Double) throws {
         _ = try checked(["set", "-displayID=\(displayID)", "-brightness=\(value)"])
+    }
+
+    /// CLI 空回答 = app 不在。装了就 `open -gj` 拉起来,轮询到它开口为止。
+    private func displayIDsAfterLaunchingApp() throws -> CommandResult {
+        guard let application, FileManager.default.fileExists(atPath: application.path) else {
+            throw BetterDisplayError.appNotRunning(application?.path ?? "not installed")
+        }
+        launcher(application)
+        let deadline = Date().addingTimeInterval(launchWait)
+        while Date() < deadline {
+            usleep(500_000)
+            let retry = try checked(["get", "--identifiers"])
+            if !retry.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return retry }
+        }
+        throw BetterDisplayError.appNotRunning(application.path)
     }
 
     private func checked(_ arguments: [String]) throws -> CommandResult {

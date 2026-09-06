@@ -78,3 +78,96 @@ import Testing
     try expectation.clear()
 }
 
+// MARK: - 2026-09-06 的两处故障
+
+private func socketPair() throws -> (server: Int32, client: Int32) {
+    var fds: [Int32] = [-1, -1]
+    try #require(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+    return (fds[0], fds[1])
+}
+
+@Test func lineReaderSurvivesInheritedNonBlockingFlagAndLateClient() throws {
+    // 复现:监听 fd 的 O_NONBLOCK 被 accept 出来的连接继承,
+    // 客户端的字节 300ms 后才到。旧实现在这里把 EAGAIN 当 EOF。
+    let (server, client) = try socketPair()
+    defer { close(server); close(client) }
+    _ = fcntl(server, F_SETFL, fcntl(server, F_GETFL) | O_NONBLOCK)
+
+    let writer = Thread {
+        usleep(300_000)
+        _ = "status\n".withCString { send(client, $0, 7, 0) }
+    }
+    writer.start()
+    #expect(ControlLineReader.readLine(from: server, timeout: 5) == .success("status"))
+}
+
+@Test func lineReaderDistinguishesEmptyTimeoutAndBadEncoding() throws {
+    do {  // 对端什么都没发就关了 → 空命令,不是「不是 UTF-8」
+        let (server, client) = try socketPair()
+        close(client)
+        defer { close(server) }
+        #expect(ControlLineReader.readLine(from: server, timeout: 1) == .failure(.empty))
+    }
+    do {  // 对端一直不说话 → 超时,而且不会把服务端卡死
+        let (server, client) = try socketPair()
+        defer { close(server); close(client) }
+        let started = Date()
+        #expect(ControlLineReader.readLine(from: server, timeout: 0.3) == .failure(.timedOut))
+        #expect(Date().timeIntervalSince(started) < 3)
+    }
+    do {  // 真的不是 UTF-8 才报这个
+        let (server, client) = try socketPair()
+        defer { close(server); close(client) }
+        let bytes: [UInt8] = [0xFF, 0xFE, 0x0A]
+        _ = bytes.withUnsafeBufferPointer { send(client, $0.baseAddress, $0.count, 0) }
+        #expect(ControlLineReader.readLine(from: server, timeout: 1) == .failure(.notUTF8))
+    }
+}
+
+/// 假的 betterdisplaycli:前 `mute` 次调用回空(模拟 app 没在跑),之后回一块显示器。
+private func makeMutedFakeCLI(in root: URL, mute: Int) throws -> URL {
+    let counter = root.appendingPathComponent("calls")
+    let script = root.appendingPathComponent("fake-betterdisplaycli")
+    try """
+    #!/bin/zsh
+    n=$(cat "\(counter.path)" 2>/dev/null || echo 0)
+    n=$((n + 1)); echo $n > "\(counter.path)"
+    if [[ "$*" == "get --identifiers" ]]; then
+      (( n > \(mute) )) && echo '{"displayID":"7"}'
+    fi
+    exit 0
+    """.write(to: script, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+    return script
+}
+
+@Test func betterDisplayClientLaunchesTheAppWhenTheCLIIsMute() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cli = try makeMutedFakeCLI(in: root, mute: 2)
+    let app = root.appendingPathComponent("BetterDisplay.app")
+    try FileManager.default.createDirectory(at: app, withIntermediateDirectories: true)
+
+    final class Launches: @unchecked Sendable { var urls: [URL] = [] }
+    let launches = Launches()
+    let client = try BetterDisplayClient(executable: cli, application: app, launchWait: 5) { launches.urls.append($0) }
+
+    #expect(try client.displayIDs() == [7])
+    #expect(launches.urls == [app])   // 拉了一次,且拉的是给定的 app
+}
+
+@Test func betterDisplayClientExplainsWhenTheAppIsNotInstalled() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let cli = try makeMutedFakeCLI(in: root, mute: 99)
+    let missing = root.appendingPathComponent("nowhere/BetterDisplay.app")
+    let client = try BetterDisplayClient(executable: cli, application: missing, launchWait: 1) { _ in }
+
+    #expect(throws: BetterDisplayError.self) { try client.displayIDs() }
+    do { _ = try client.displayIDs() } catch let error as BetterDisplayError {
+        guard case .appNotRunning = error else { Issue.record("expected appNotRunning, got \(error)"); return }
+    }
+}
+

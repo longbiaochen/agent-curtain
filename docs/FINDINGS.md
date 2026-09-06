@@ -316,3 +316,48 @@ isReleasedWhenClosed=false   close() 后 weak 仍存活                → 退�
 2. 屏幕数没变时只 `setFrame` 挪位置,不销毁重建。分辨率变化、显示器睡醒
    这类最常见的屏幕参数变化根本不需要重建窗口,顺带完全绕开了销毁路径。
 
+## 11. 2026-09-06:「curtain 坏了」其实是两件事
+
+当天 `curtain status` 回 `{"error":"command is not UTF-8","ok":false}`,`curtain on`
+报「没有显示器」。看护日志回看,`state=unknown`(就是这个 not-UTF-8)从 09-02
+17:44 起就零星出现,09-06 机器 load 294 时几乎必现。
+
+### 11.1 控制 socket 的读竞态
+
+`ControlServer` 给监听 fd 设了 `O_NONBLOCK`,而 **macOS 上 `accept()` 出来的连接
+继承这个标志**(BSD 语义,Linux 不继承)。`serve()` 里的 `recv` 循环把
+`count <= 0` 一律当 EOF —— 客户端的字节还没到,`recv` 返回 -1/EAGAIN,循环退出,
+拿着空串去 `String(data:encoding:)`,得到 `""`,split 后 `first` 是 nil,于是报
+「不是 UTF-8」。**错误文案指向了完全无关的方向。**
+
+确定性复现:连上 socket 什么都不发,服务端立刻回错误 —— 它根本没等。
+
+修法在 `ControlLineReader`:读之前清掉 `O_NONBLOCK`、设 `SO_RCVTIMEO`(5s),
+EAGAIN 只在超时后才出现,并把「空命令 / 超时 / 不是 UTF-8 / 太长」分开报。
+超时是必要的:`serve` 跑在串行队列上,一个不说话的客户端原本能把整个控制面卡死。
+回归测试用 `socketpair` + 读端 `O_NONBLOCK` + 300ms 后才写,精确复现继承标志下的
+晚到客户端。
+
+### 11.2 重启后 BetterDisplay 没回来
+
+08:46 机器重启。BetterDisplay.app 不在登录项里,没跟着起来。而 `betterdisplaycli`
+只是个前端:**app 不在时它什么都不回、退出码还是 0** —— 静默失败。
+`displayIDs()` 于是抛「没有显示器」,`curtain on` 死在调暗这步。
+(至少是安全方向:没有调暗就不会阻断输入。)
+
+AgentCurtain.app 同样不在登录项,但瘦客户端在 socket 不在时会 `open -gj`
+把它拉起来;BetterDisplay 没有这条后路。现在 `BetterDisplayClient` 在拿到空的
+显示器列表时,先 `open -gj /Applications/BetterDisplay.app`,轮询到 CLI 开口为止
+(上限 10s),装都没装才报 `appNotRunning`。`doctor` 也会说 app 在不在。
+launcher 做成可注入,测试里用假 CLI「前两次沉默、第三次开口」验证重试路径,
+不会真的去开 app。
+
+### 教训
+
+- **错误文案要说读到了什么**,不要替读取失败编一个原因。「不是 UTF-8」让第一轮
+  排查去查编码,而真相是「什么都没读到」。
+- 一个只回空、退出码为 0 的 CLI 是最坏的依赖形态。对这种依赖要在**调用方**补上
+  「空 = 不在」的判断,而不是指望它有一天会报错。
+- 常驻服务的依赖也得能自愈或至少自述。重启后少了一个登录项就整套失灵,
+  而且没有任何提示 —— 这和 §9 是同一类问题:**不是崩溃,是没被装回去**。
+

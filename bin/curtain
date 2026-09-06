@@ -88,6 +88,14 @@ case "${1:-status}" in
       print -u2 '[fail] designated requirement is not stable Developer ID form'; exit 1
     }
     command -v betterdisplaycli >/dev/null || { print -u2 '[fail] betterdisplaycli missing'; exit 1; }
+    # betterdisplaycli 在 BetterDisplay.app 不在时什么都不回、退出码还是 0 ——
+    # 2026-09-06 重启后就是这样静默失败的。app 现在会在需要时自己拉它,
+    # 但 doctor 应该把这件事说出来。
+    if pgrep -xq BetterDisplay; then
+      print '[ok] BetterDisplay.app is running'
+    else
+      print '[warn] BetterDisplay.app is not running; curtain on will launch it (add it to Login Items to avoid the delay)'
+    fi
     response=$(send_command status)
     permissions=$(stat -f '%Lp' "$socket_path")
     [[ "$permissions" == 600 ]] || { print -u2 "[fail] socket mode is $permissions"; exit 1; }
