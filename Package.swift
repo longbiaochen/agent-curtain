@@ -10,7 +10,14 @@ let package = Package(
         .executable(name: "AgentCurtainRestoreWatchdog", targets: ["AgentCurtainRestoreWatchdog"]),
     ],
     targets: [
-        .target(name: "AgentCurtainCore"),
+        .target(
+            name: "AgentCurtainCore",
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("ApplicationServices"),
+                .linkedFramework("CoreGraphics"),
+            ]
+        ),
         .executableTarget(
             name: "AgentCurtain",
             dependencies: ["AgentCurtainCore"],

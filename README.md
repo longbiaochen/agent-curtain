@@ -25,9 +25,11 @@ component that needs Accessibility permission. It contains:
 - an `NSStatusItem` menu showing open/drawn state and live counters;
 - a `kCGHIDEventTap` blocker with deny-before-allow decisions;
 - one framebuffer-visible banner window per display;
-- BetterDisplay brightness control addressed only by `displayID`;
+- system display SPI for disconnecting and reconnecting external displays, with UUID topology restoration;
+- a mode-0600 window snapshot that returns visible external-display windows to their original display and frame;
+- BetterDisplay for brightness and layout, with Pro connection management used only if the system SPI is unavailable;
 - a mode-0600 Unix socket at `~/.local/state/curtain/control.sock`;
-- an embedded recovery watchdog that restores brightness if the app is killed.
+- an embedded recovery watchdog that reconnects displays and restores brightness if the app is killed, then relaunches AgentCurtain to restore window frames under the app's Accessibility permission.
 
 The `curtain` command is a thin, unprivileged socket client. It never creates an
 event tap and therefore needs no TCC permission.
@@ -38,7 +40,7 @@ Requirements:
 
 - Apple Silicon and macOS 26 or newer;
 - Xcode Command Line Tools;
-- BetterDisplay with `betterdisplaycli` installed;
+- BetterDisplay with `betterdisplaycli` installed; Pro is an optional fallback;
 - the Developer ID identity named in the PRD when building from source.
 
 ```bash
@@ -107,17 +109,22 @@ The default denylist contains the three Karabiner components required by the PRD
 The draw transition is ordered and rollback-safe:
 
 1. confirm that AgentCurtain has Accessibility permission;
-2. read each active display’s brightness by `displayID`;
-3. atomically write a mode-0600 recovery file;
+2. snapshot display topology and visible windows on external displays by display UUID;
+3. read each active display’s brightness by `displayID` and atomically write mode-0600 recovery files;
 4. start the embedded recovery watchdog;
 5. set each brightness to zero and read it back;
-6. arm the HID event tap and create one banner per screen.
+6. arm the HID event tap, create one banner per screen, and disconnect external displays.
 
 Any failure rolls brightness back. Normal `off`, menu-bar quit, `SIGTERM`, a
 timed release, and the release shortcut all restore brightness. `kill -9` cannot
 run app cleanup, so the independent embedded watchdog observes process death and
-restores from the same recovery file. On a later launch, the app retries any
-orphaned restore record.
+restores display topology and brightness from the same recovery files, then relaunches
+AgentCurtain so the main app restores windows under its Accessibility permission.
+Window restoration waits for stable display bounds, matches surviving windows by CG
+window ID, AX identifier, title, and stable application order, then uses a verified
+size-position-size update without activating or raising applications. Full-screen,
+minimized, hidden-Space, and newly created windows are left alone. On a later launch,
+the app retries any orphaned restore record.
 
 Display-change notifications rebuild banners and reconcile newly attached
 display IDs into the brightness backup before dimming them.
@@ -151,3 +158,5 @@ physical keys and use the mouse to prove the `blocked` counter rises without UI
 response. Programmatically injected events cannot prove that HID-layer behavior.
 The full requirement-by-requirement checklist is in
 [docs/PRD-menubar-app.md](docs/PRD-menubar-app.md#9-验收标准).
+
+Brightness default: releasing the curtain (including crash recovery) sets every saved display to 100%, regardless of its pre-curtain brightness.

@@ -1,0 +1,77 @@
+import Foundation
+import Testing
+@testable import AgentCurtainCore
+
+@Suite struct BrightnessRestorationTests {
+    @Test func reconciliationRedimsReappearingDisplayAndRefreshesChangedID() throws {
+        let existing = [
+            DisplayBrightness(displayID: 7, brightness: 0.6, uuid: "same-id"),
+            DisplayBrightness(displayID: 8, brightness: 0.7, uuid: "changed-id"),
+        ]
+        let active = [
+            DisplayIdentity(displayID: 7, uuid: "same-id"),
+            DisplayIdentity(displayID: 18, uuid: "changed-id"),
+        ]
+
+        let plan = try BrightnessRestoration.reconciliationPlan(
+            existing: existing,
+            active: active,
+            currentBrightness: { $0 == 7 ? 0.8 : 0 }
+        )
+
+        #expect(plan.updated.map(\.displayID) == [7, 18])
+        #expect(plan.toDim.map(\.displayID) == [7, 18])
+        #expect(plan.updated.map(\.brightness) == [0.6, 0.7])
+    }
+
+    @Test func followsUUIDAfterDisplayIDChanges() throws {
+        let saved = DisplayBrightness(displayID: 3, brightness: 0.8, uuid: "dell")
+        let active = [DisplayIdentity(displayID: 3, uuid: "other"), DisplayIdentity(displayID: 5, uuid: "dell")]
+        #expect(try BrightnessRestoration.target(for: saved, active: active) == 5)
+    }
+
+    @Test func neverFallsBackToReusedIDWhenUUIDMissing() {
+        #expect(throws: (any Error).self) {
+            try BrightnessRestoration.target(for: DisplayBrightness(displayID: 3, brightness: 0.8, uuid: "dell"),
+                active: [DisplayIdentity(displayID: 3, uuid: "other")])
+        }
+    }
+
+    @Test func oldBackupRemainsReadable() throws {
+        let data = Data(#"{"displayID":3,"brightness":0.8}"#.utf8)
+        let saved = try JSONDecoder().decode(DisplayBrightness.self, from: data)
+        #expect(saved.uuid == nil)
+        #expect(try BrightnessRestoration.target(for: saved, active: [DisplayIdentity(displayID: 3, uuid: "dell")]) == 3)
+    }
+
+    @Test func continuesAfterMissingDisplayAndRejectsFalseSuccess() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cli = root.appendingPathComponent("cli")
+        try #"""
+        #!/bin/sh
+        if [ "$2" = "--identifiers" ]; then
+            echo '[{"displayID":5,"UUID":"dell"},{"displayID":4,"UUID":"mi"}]'
+        else
+            printf '%s\n' "$*" >> "${0%/*}/calls"
+            echo 0.15
+        fi
+        """#.write(to: cli, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: cli.path)
+        let client = try BetterDisplayClient(executable: cli, application: nil)
+        let backup = BrightnessBackup(ownerPID: 1, displays: [
+            DisplayBrightness(displayID: 2, brightness: 0.8, uuid: "absent"),
+            DisplayBrightness(displayID: 3, brightness: 0.8, uuid: "dell"),
+            DisplayBrightness(displayID: 4, brightness: 1, uuid: "mi")])
+        #expect(throws: (any Error).self) { try BrightnessRestoration.restore(backup, client: client) }
+        let calls = try String(contentsOf: root.appendingPathComponent("calls"), encoding: .utf8)
+        #expect(calls.contains("-displayID=5 -brightness=1.0"))
+        #expect(calls.contains("-displayID=4 -brightness=1.0"))
+        // Full brightness is the saved default even when the pre-curtain value was lower.
+        let script = try String(contentsOf: cli, encoding: .utf8).replacingOccurrences(of: "echo 0.15", with: "echo 1.0")
+        try script.write(to: cli, atomically: false, encoding: .utf8)
+        try BrightnessRestoration.restore(BrightnessBackup(ownerPID: 1, displays: [
+            DisplayBrightness(displayID: 3, brightness: 0.2, uuid: "dell")]), client: client)
+    }
+}

@@ -62,6 +62,15 @@ public struct ControlResponse: Codable, Equatable, Sendable {
     public var ok: Bool
     public var state: String?
     public var displays: Int?
+    public var activeDisplays: Int?
+    public var displayMode: String?
+    public var restorePending: Int?
+    public var windowRestorePending: Int?
+    public var windows: Int?
+    public var restoredWindows: Int?
+    public var displayBackend: String?
+    public var betterDisplayPro: String?
+    public var privateDisplaySPI: String?
     public var blocked: UInt64?
     public var allowed: UInt64?
     public var denied: Int?
@@ -72,6 +81,15 @@ public struct ControlResponse: Codable, Equatable, Sendable {
         ok: Bool,
         state: String? = nil,
         displays: Int? = nil,
+        activeDisplays: Int? = nil,
+        displayMode: String? = nil,
+        restorePending: Int? = nil,
+        windowRestorePending: Int? = nil,
+        windows: Int? = nil,
+        restoredWindows: Int? = nil,
+        displayBackend: String? = nil,
+        betterDisplayPro: String? = nil,
+        privateDisplaySPI: String? = nil,
         blocked: UInt64? = nil,
         allowed: UInt64? = nil,
         denied: Int? = nil,
@@ -81,6 +99,15 @@ public struct ControlResponse: Codable, Equatable, Sendable {
         self.ok = ok
         self.state = state
         self.displays = displays
+        self.activeDisplays = activeDisplays
+        self.displayMode = displayMode
+        self.restorePending = restorePending
+        self.windowRestorePending = windowRestorePending
+        self.windows = windows
+        self.restoredWindows = restoredWindows
+        self.displayBackend = displayBackend
+        self.betterDisplayPro = betterDisplayPro
+        self.privateDisplaySPI = privateDisplaySPI
         self.blocked = blocked
         self.allowed = allowed
         self.denied = denied

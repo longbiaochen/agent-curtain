@@ -19,7 +19,12 @@ final class MenuBarController: NSObject, NSMenuDelegate {
     }
 
     func refresh() {
-        let symbol = coordinator.phase == .drawn ? "eye.slash.fill" : "eye"
+        let symbol: String
+        switch coordinator.phase {
+        case .drawn: symbol = "eye.slash.fill"
+        case .drawing, .opening: symbol = "hourglass"
+        default: symbol = "eye"
+        }
         statusItem.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: coordinator.statusSummary)
         statusItem.button?.toolTip = coordinator.statusSummary
     }
@@ -34,9 +39,14 @@ final class MenuBarController: NSObject, NSMenuDelegate {
 
         switch coordinator.phase {
         case .open:
-            menu.addItem(item("拉上幕帘", action: #selector(drawCurtain), key: "l"))
+            if coordinator.lastError != nil {
+                menu.addItem(item("重试恢复显示器", action: #selector(openCurtain), key: "u"))
+            }
+            menu.addItem(item("启用保护", action: #selector(drawCurtain), key: "l"))
         case .drawn:
-            menu.addItem(item("拉开幕帘", action: #selector(openCurtain), key: "u"))
+            menu.addItem(item("解除保护", action: #selector(openCurtain), key: "u"))
+        case .drawing:
+            menu.addItem(item("取消启用", action: #selector(openCurtain), key: "u"))
         default:
             let transition = NSMenuItem(title: coordinator.statusSummary, action: nil, keyEquivalent: "")
             transition.isEnabled = false

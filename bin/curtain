@@ -34,7 +34,7 @@ prepare_config() {
 send_command() {
   local command=$1
   if [[ ! -S "$socket_path" && -d "$installed_app" ]]; then
-    /usr/bin/open -gj "$installed_app" >/dev/null 2>&1 || true
+    /usr/bin/open -g "$installed_app" >/dev/null 2>&1 || true
   fi
   python3 -c 'import socket,sys,time
 path,command=sys.argv[1],sys.argv[2]
@@ -88,6 +88,30 @@ case "${1:-status}" in
       print -u2 '[fail] designated requirement is not stable Developer ID form'; exit 1
     }
     command -v betterdisplaycli >/dev/null || { print -u2 '[fail] betterdisplaycli missing'; exit 1; }
+    betterdisplay_pro=$(betterdisplaycli get -proAvailable 2>/dev/null || true)
+    if [[ -z "$betterdisplay_pro" && -d /Applications/BetterDisplay.app ]]; then
+      /usr/bin/open -gj /Applications/BetterDisplay.app >/dev/null 2>&1 || true
+      for _ in {1..20}; do
+        sleep 0.25
+        betterdisplay_pro=$(betterdisplaycli get -proAvailable 2>/dev/null || true)
+        [[ -n "$betterdisplay_pro" ]] && break
+      done
+    fi
+    private_display_spi=unsupported-architecture
+    if [[ "$(uname -m)" == arm64 ]]; then
+      if python3 -c 'import ctypes
+core_graphics=ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+getattr(core_graphics, "CGSConfigureDisplayEnabled")' >/dev/null 2>&1; then
+        private_display_spi=available
+      else
+        private_display_spi=missing
+      fi
+    fi
+    print "[info] privateDisplaySPI=$private_display_spi"
+    print "[info] betterDisplayPro=${betterdisplay_pro:-unknown}"
+    if [[ "$private_display_spi" != available && "$betterdisplay_pro" != on ]]; then
+      print -u2 '[fail] no display connection backend is available'; exit 1
+    fi
     # betterdisplaycli 在 BetterDisplay.app 不在时什么都不回、退出码还是 0 ——
     # 2026-09-06 重启后就是这样静默失败的。app 现在会在需要时自己拉它,
     # 但 doctor 应该把这件事说出来。
@@ -96,15 +120,6 @@ case "${1:-status}" in
     else
       print '[warn] BetterDisplay.app is not running; curtain on will launch it'
     fi
-    # 重启后两个 app 都得自己回来,否则又是 2026-09-06 那种静默失灵。
-    login_items=$(osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null | tr ',' '\n' | sed 's/^ *//')
-    for name in BetterDisplay AgentCurtain; do
-      if print -r -- "$login_items" | grep -qx "$name"; then
-        print "[ok] $name is a login item"
-      else
-        print "[warn] $name is not a login item; it will not come back after a reboot (rerun install)"
-      fi
-    done
     response=$(send_command status)
     permissions=$(stat -f '%Lp' "$socket_path")
     [[ "$permissions" == 600 ]] || { print -u2 "[fail] socket mode is $permissions"; exit 1; }

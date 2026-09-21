@@ -1,6 +1,6 @@
 # AgentCurtain
 
-**拉上幕帘，后台照常演出。**
+**启用保护，后台任务照常运行。**
 
 AgentCurtain 是面向 macOS 26+ 无人值守 GUI agent 会话的菜单栏应用。它把每块
 物理显示器调暗，在 HID 事件层阻断物理键鼠，同时让未锁定的 WindowServer 会话
@@ -11,20 +11,22 @@ AgentCurtain 是面向 macOS 26+ 无人值守 GUI agent 会话的菜单栏应用
 [验收矩阵](docs/ACCEPTANCE-menubar-app.md)
 
 > AgentCurtain 弱于真锁屏。它防的是路过同事、进屋访客等机会型接触，防不住
-> 有准备的攻击者、重启、插入新输入设备或物理拆机。UI 只会说“幕帘已拉上”，
-> 不会把它表述成“已锁定”或“安全”。
+> 有准备的攻击者、重启、插入新输入设备或物理拆机。“屏幕关闭·输入锁定”表示
+> 屏幕亮度归零并启用输入拦截，不等同于 macOS 系统锁屏。
 
 ## 交付形态
 
 `/Applications/AgentCurtain.app` 是唯一安装的运行主体，也是唯一需要辅助功能
 授权的对象。app 内含：
 
-- 显示拉开/拉上状态及实时计数的 `NSStatusItem` 菜单；
+- 显示保护状态及实时计数的 `NSStatusItem` 菜单；
 - 拒绝优先判定、可自愈的 `kCGHIDEventTap` 阻断器；
 - 每块显示器一个、可在 framebuffer 中扫描到的提示条；
-- 只按 `displayID` 定址的 BetterDisplay 亮度控制；
+- 优先用系统显示 SPI 断开/重连外屏，并用 UUID 恢复显示拓扑；
+- 以显示 UUID 记录外屏可见窗口，解除保护后恢复其原显示器和原位置；
+- BetterDisplay 用于亮度和布局，Pro 连接管理仅作系统 SPI 不可用时的回退；
 - `~/.local/state/curtain/control.sock` 上权限为 0600 的 Unix socket；
-- app 被强杀时独立恢复亮度的包内看门狗。
+- app 被强杀时独立恢复显示拓扑和亮度，再重启 AgentCurtain，由主程序在辅助功能权限下恢复窗口位置的包内看门狗。
 
 `curtain` 是不持有权限的瘦 socket 客户端。它不会创建事件 tap，因此不需要任何
 TCC 授权。
@@ -35,7 +37,7 @@ TCC 授权。
 
 - Apple Silicon、macOS 26 或以上；
 - Xcode Command Line Tools；
-- 已安装带 `betterdisplaycli` 的 BetterDisplay；
+- 已安装带 `betterdisplaycli` 的 BetterDisplay；Pro 为可选回退；
 - 从源码构建时，钥匙串内有 PRD 指定的 Developer ID 身份。
 
 ```bash
@@ -77,8 +79,12 @@ curtain on --allow-any-injected
 
 拒绝名单为空时，`--allow-any-injected` 会被拒绝。全局快捷键：
 
-- `Ctrl+Opt+Cmd+Shift+L`：拉上幕帘；
-- `Ctrl+Opt+Cmd+Shift+U`：拉开幕帘。
+- `Ctrl+Opt+Cmd+Shift+L`：启用保护；
+- `Ctrl+Opt+Cmd+Shift+U`：解除保护，也可取消正在进行的启用操作。
+
+提示条与各屏菜单栏等高、居中显示；刘海屏将状态和快捷键放在刘海两侧，左右对称。
+操作开始立即显示浅色“启用中”或“解除中”。启用完成才变为深红“屏幕关闭·输入锁定”；解除
+完成后短暂显示“已解除”并淡出。窗口在状态切换时保持原位。
 
 解除热键在 HID 回调吞掉按键前检查。`curtain off` 只与 app 的 socket 通信，
 包括从 SSH 执行时也不需要辅助功能权限。
@@ -96,24 +102,32 @@ curtain on --allow-any-injected
 
 ## 运行安全
 
-拉上幕帘的顺序可回滚：
+启用保护的顺序可回滚：
 
-1. 先确认 AgentCurtain 自己已有辅助功能授权；
-2. 按 `displayID` 读取所有活动显示器原亮度；
-3. 原子写入权限 0600 的恢复记录；
+1. 先确认 AgentCurtain 自己已有辅助功能授权，并显示浅色“启用中”；
+2. 按显示 UUID 记录显示拓扑及外屏当前可见窗口的原位置；
+3. 按 `displayID` 读取所有活动显示器原亮度，并原子写入权限 0600 的恢复记录；
 4. 启动包内独立恢复看门狗；
-5. 把每块屏调到 0 并逐块读回；
-6. 挂上 HID event tap，并为每块屏创建提示条。
+5. 逐屏在一次 BetterDisplay 调用中设置亮度为 0 并读回；
+6. 挂上 HID event tap，把内屏设为临时主屏，并优先通过一次系统 SPI 事务断开所有外屏；
+7. 核对仅剩内屏后，提示条变为深红“屏幕关闭·输入锁定”。
 
-任何一步失败都会回滚亮度。正常 `off`、从菜单退出、`SIGTERM`、定时解除和解除
-热键都会恢复亮度。`kill -9` 无法执行 app 清理，因此独立看门狗会观察主进程退出，
-使用同一恢复文件复原；下次启动还会重试孤立的恢复记录。
+任何一步失败都会重连外屏并回滚显示拓扑和亮度。正常 `off`、从菜单退出、`SIGTERM`、
+定时解除和解除热键都会先恢复原来的主屏、排列、分辨率和旋转，再恢复亮度和窗口位置。
+`kill -9` 无法执行 app 清理，因此独立看门狗会观察主进程退出，使用权限 0600 的恢复记录
+恢复显示拓扑和亮度，再重启 AgentCurtain，由持有辅助功能权限的主程序回放窗口；后续启动仍会
+重试孤立的恢复记录。窗口回放会等待显示器 bounds 稳定，优先按 CGWindowID、AXIdentifier、
+标题和稳定窗口顺序做一对一匹配，再使用 `size → position → size` 写入并读回验证；不会激活或
+抬升应用。全屏、最小化、其他 Space 中不可见及保护期间新增的窗口不会被移动。
 
-显示器变化通知会重建提示条，并把新插入的 `displayID` 及其原亮度追加到恢复记录，
-随后再调暗新屏。
+显示器变化通知会重建提示条，并把新插入显示器的 UUID、拓扑及原亮度追加到恢复记录，
+随后调暗并断开新外屏，使保护期间始终只保留内屏。
 
 AgentCurtain 绝不调用 `pmset displaysleepnow`，因为 display sleep 会停止
 framebuffer 合成，让 GUI agent 失明。
+
+显示连接优先使用运行时解析的私有 `CGSConfigureDisplayEnabled`，BetterDisplay Pro
+只在该符号不可用时回退。私有 SPI 可能随 macOS 更新变化，升级系统后应重新执行硬件验收。
 
 ## 开发与验证
 
@@ -126,7 +140,7 @@ framebuffer 合成，让 GUI agent 失明。
 Codex 的 Run 按钮也指向同一脚本。`--verify` 会运行 Swift 测试、严格验证签名、
 启动已签名 bundle、检查 socket 权限为 0600，并验证 JSON `status` 响应。
 
-幕帘拉上时，用下列命令逐块验证 framebuffer 中真的画出了提示条：
+保护启用后，用下列命令逐块验证 framebuffer 中真的画出了提示条：
 
 ```bash
 ./script/verify_banner_framebuffer.sh
@@ -139,3 +153,5 @@ Codex 的 Run 按钮也指向同一脚本。`--verify` 会运行 Swift 测试、
 应看到 `blocked` 上升且界面无响应。程序化注入到不了同一 HID 路径，不能替代这项
 证据。完整逐项清单见
 [docs/PRD-menubar-app.md](docs/PRD-menubar-app.md#9-验收标准)。
+
+亮度默认值：解除保护（包括崩溃恢复）后，所有已记录屏幕均设为 100%，不再恢复为启用保护前的较低亮度。

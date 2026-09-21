@@ -89,7 +89,7 @@ final class ControlServer {
         }
         do {
             let command = try ControlCommand.parse(line)
-            DispatchQueue.main.async { [handler] in
+            DispatchQueue.main.async { [handler, weak self] in
                 handler(command) { [weak self] response in self?.send(response, to: client) }
             }
         } catch {

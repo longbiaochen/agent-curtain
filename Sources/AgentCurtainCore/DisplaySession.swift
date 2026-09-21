@@ -1,0 +1,298 @@
+import Darwin
+import Foundation
+
+public struct DisplayTopology: Codable, Equatable, Sendable {
+    public let uuid: String
+    public let displayID: Int
+    public let isBuiltin: Bool
+    public let wasMain: Bool
+    public let placement: String
+    public let resolution: String
+    public let rotation: String?
+
+    public init(
+        uuid: String,
+        displayID: Int,
+        isBuiltin: Bool,
+        wasMain: Bool,
+        placement: String,
+        resolution: String,
+        rotation: String?
+    ) {
+        self.uuid = uuid
+        self.displayID = displayID
+        self.isBuiltin = isBuiltin
+        self.wasMain = wasMain
+        self.placement = placement
+        self.resolution = resolution
+        self.rotation = rotation
+    }
+}
+
+public struct DisplaySessionBackup: Codable, Equatable, Sendable {
+    public let version: Int
+    public let ownerPID: Int32
+    public let createdAt: Date
+    public let connectionBackend: DisplayConnectionBackendKind?
+    public let displays: [DisplayTopology]
+
+    public init(
+        ownerPID: Int32,
+        createdAt: Date = Date(),
+        connectionBackend: DisplayConnectionBackendKind? = nil,
+        displays: [DisplayTopology]
+    ) {
+        version = connectionBackend == nil ? 1 : 2
+        self.ownerPID = ownerPID
+        let milliseconds = (createdAt.timeIntervalSince1970 * 1_000).rounded(.towardZero)
+        self.createdAt = Date(timeIntervalSince1970: milliseconds / 1_000)
+        self.connectionBackend = connectionBackend
+        self.displays = displays
+    }
+
+    public var builtin: DisplayTopology? { displays.first(where: \.isBuiltin) }
+}
+
+public enum DisplaySessionBackupStore {
+    public static func write(_ backup: DisplaySessionBackup, to url: URL) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        encoder.dateEncodingStrategy = .millisecondsSince1970
+        try encoder.encode(backup).write(to: url, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
+
+    public static func read(from url: URL) throws -> DisplaySessionBackup {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .millisecondsSince1970
+        return try decoder.decode(DisplaySessionBackup.self, from: Data(contentsOf: url))
+    }
+
+    public static func claim(_ url: URL) throws -> URL? {
+        guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+        let claimed = URL(fileURLWithPath: url.path + ".restoring.\(getpid())")
+        do {
+            try FileManager.default.moveItem(at: url, to: claimed)
+            return claimed
+        } catch let error as NSError
+            where error.domain == NSCocoaErrorDomain && error.code == NSFileNoSuchFileError {
+            return nil
+        }
+    }
+
+    public static func relinquish(_ claimed: URL, to original: URL) throws {
+        guard FileManager.default.fileExists(atPath: claimed.path) else { return }
+        try FileManager.default.moveItem(at: claimed, to: original)
+    }
+}
+
+public enum DisplaySessionError: Error, LocalizedError {
+    case missingUUID(Int)
+    case invalidBuiltinCount(Int)
+    case missingMainDisplay
+    case noBackup
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingUUID(let id): return "displayID=\(id) has no stable UUID"
+        case .invalidBuiltinCount(let count): return "expected one active built-in display, found \(count)"
+        case .missingMainDisplay: return "the saved main display is unavailable"
+        case .noBackup: return "display session backup is missing"
+        }
+    }
+}
+
+public enum DisplaySessionOperations {
+    public static func capture(
+        ownerPID: Int32,
+        client: BetterDisplayClient,
+        connectionBackend: DisplayConnectionBackendKind? = nil
+    ) throws -> DisplaySessionBackup {
+        let active = try client.activeDisplays()
+        let builtinCount = active.filter(\.isBuiltin).count
+        guard builtinCount == 1 else { throw DisplaySessionError.invalidBuiltinCount(builtinCount) }
+
+        let displays = try active.map { identity -> DisplayTopology in
+            guard let uuid = identity.uuid, !uuid.isEmpty else {
+                throw DisplaySessionError.missingUUID(identity.displayID)
+            }
+            let main = try client.feature("main", uuid: uuid).lowercased()
+            return DisplayTopology(
+                uuid: uuid,
+                displayID: identity.displayID,
+                isBuiltin: identity.isBuiltin,
+                wasMain: main == "true" || main == "on" || main == "1",
+                placement: try client.feature("placement", uuid: uuid),
+                resolution: try client.feature("resolution", uuid: uuid),
+                rotation: try? client.feature("rotation", uuid: uuid)
+            )
+        }
+        guard displays.contains(where: \.wasMain) else { throw DisplaySessionError.missingMainDisplay }
+        return DisplaySessionBackup(
+            ownerPID: ownerPID,
+            connectionBackend: connectionBackend,
+            displays: displays
+        )
+    }
+
+    public static func disconnectExternalDisplays(
+        backup: DisplaySessionBackup,
+        client: BetterDisplayClient,
+        backend: any DisplayConnectionBackend,
+        isCancelled: @Sendable () -> Bool = { false }
+    ) throws -> Int {
+        try disconnectDisplays(
+            backup.displays.filter { !$0.isBuiltin },
+            backup: backup,
+            client: client,
+            backend: backend,
+            isCancelled: isCancelled
+        )
+        return backup.displays.count
+    }
+
+    public static func disconnectDisplays(
+        _ displays: [DisplayTopology],
+        backup: DisplaySessionBackup,
+        client: BetterDisplayClient,
+        backend: any DisplayConnectionBackend,
+        isCancelled: @Sendable () -> Bool = { false }
+    ) throws {
+        guard let builtin = backup.builtin else { throw DisplaySessionError.invalidBuiltinCount(0) }
+        guard displays.contains(where: { !$0.isBuiltin }) else { return }
+        if isCancelled() { throw CancellationError() }
+        let activeUUIDs = Set(try client.activeDisplays().compactMap(\.uuid))
+        if activeUUIDs.contains(builtin.uuid) {
+            let main = try client.feature("main", uuid: builtin.uuid).lowercased()
+            if main != "true" && main != "on" && main != "1" {
+                try client.setFeature("main", value: "on", uuid: builtin.uuid)
+                try client.waitForMainDisplay(uuid: builtin.uuid)
+            }
+        } else if backend.kind != .systemSPI {
+            throw DisplayConnectionBackendError.configuration(
+                "built-in display is not active before BetterDisplay fallback disconnect"
+            )
+        }
+        if isCancelled() { throw CancellationError() }
+        try backend.disconnect(
+            displays: displays,
+            backup: backup,
+            isCancelled: isCancelled
+        )
+        if isCancelled() { throw CancellationError() }
+        _ = try client.waitForActiveDisplays(uuids: [builtin.uuid], exact: true)
+    }
+
+    public static func mergeNewActiveDisplays(
+        into backup: DisplaySessionBackup,
+        client: BetterDisplayClient
+    ) throws -> DisplaySessionBackup {
+        let refreshed = refreshDisplayIDs(in: backup, identities: try client.displays())
+        let known = Set(refreshed.displays.map(\.uuid))
+        let active = try client.activeDisplays()
+        let additions = try active.compactMap { identity -> DisplayTopology? in
+            guard let uuid = identity.uuid else { throw DisplaySessionError.missingUUID(identity.displayID) }
+            guard !known.contains(uuid) else { return nil }
+            let main = try client.feature("main", uuid: uuid).lowercased()
+            return DisplayTopology(
+                uuid: uuid,
+                displayID: identity.displayID,
+                isBuiltin: identity.isBuiltin,
+                wasMain: main == "true" || main == "on" || main == "1",
+                placement: try client.feature("placement", uuid: uuid),
+                resolution: try client.feature("resolution", uuid: uuid),
+                rotation: try? client.feature("rotation", uuid: uuid)
+            )
+        }
+        guard !additions.isEmpty else { return refreshed }
+        return DisplaySessionBackup(ownerPID: refreshed.ownerPID, createdAt: refreshed.createdAt,
+            connectionBackend: refreshed.connectionBackend,
+            displays: refreshed.displays + additions)
+    }
+
+    public static func refreshDisplayIDs(
+        in backup: DisplaySessionBackup,
+        identities: [DisplayIdentity]
+    ) -> DisplaySessionBackup {
+        var currentIDs: [String: Int] = [:]
+        for identity in identities {
+            if let uuid = identity.uuid { currentIDs[uuid] = identity.displayID }
+        }
+        let refreshed = backup.displays.map { saved -> DisplayTopology in
+            guard let current = currentIDs[saved.uuid], current != saved.displayID else { return saved }
+            return DisplayTopology(
+                uuid: saved.uuid,
+                displayID: current,
+                isBuiltin: saved.isBuiltin,
+                wasMain: saved.wasMain,
+                placement: saved.placement,
+                resolution: saved.resolution,
+                rotation: saved.rotation
+            )
+        }
+        guard refreshed != backup.displays else { return backup }
+        return DisplaySessionBackup(
+            ownerPID: backup.ownerPID,
+            createdAt: backup.createdAt,
+            connectionBackend: backup.connectionBackend,
+            displays: refreshed
+        )
+    }
+
+    public static func activeExternalDisplays(
+        in backup: DisplaySessionBackup,
+        client: BetterDisplayClient
+    ) throws -> [DisplayTopology] {
+        let activeUUIDs = Set(try client.activeDisplays().compactMap(\.uuid))
+        return backup.displays.filter { !$0.isBuiltin && activeUUIDs.contains($0.uuid) }
+    }
+
+    public static func restore(
+        _ backup: DisplaySessionBackup,
+        client: BetterDisplayClient,
+        backend: any DisplayConnectionBackend
+    ) throws {
+        try backend.reconnectDisplays(backup: backup)
+
+        var failures: [String] = []
+        for saved in backup.displays {
+            do {
+                if try client.feature("resolution", uuid: saved.uuid) != saved.resolution {
+                    try client.setFeature("resolution", value: saved.resolution, uuid: saved.uuid)
+                }
+                if let rotation = saved.rotation,
+                   (try? client.feature("rotation", uuid: saved.uuid)) != rotation {
+                    try client.setFeature("rotation", value: rotation, uuid: saved.uuid)
+                }
+            } catch {
+                failures.append("\(saved.uuid): \(error.localizedDescription)")
+            }
+        }
+
+        if let main = backup.displays.first(where: \.wasMain) {
+            do {
+                let current = try client.feature("main", uuid: main.uuid).lowercased()
+                if current != "true" && current != "on" && current != "1" {
+                    try client.setFeature("main", value: "on", uuid: main.uuid)
+                }
+            } catch {
+                failures.append("main \(main.uuid): \(error.localizedDescription)")
+            }
+        } else {
+            failures.append(DisplaySessionError.missingMainDisplay.localizedDescription)
+        }
+
+        for saved in backup.displays {
+            do {
+                if try client.feature("placement", uuid: saved.uuid) != saved.placement {
+                    try client.setFeature("placement", value: saved.placement, uuid: saved.uuid)
+                }
+            } catch {
+                failures.append("\(saved.uuid) placement: \(error.localizedDescription)")
+            }
+        }
+        if !failures.isEmpty {
+            throw BetterDisplayError.commandFailed(failures.joined(separator: "; "))
+        }
+    }
+}

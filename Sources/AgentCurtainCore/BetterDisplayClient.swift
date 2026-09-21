@@ -1,4 +1,5 @@
 import Darwin
+import CoreGraphics
 import Foundation
 
 public struct CommandResult: Sendable {
@@ -41,6 +42,8 @@ public enum BetterDisplayError: Error, LocalizedError {
     case invalidDisplayList
     case invalidBrightness(Int)
     case appNotRunning(String)
+    case proRequired
+    case invalidValue(String)
 
     public var errorDescription: String? {
         switch self {
@@ -51,6 +54,8 @@ public enum BetterDisplayError: Error, LocalizedError {
         case .invalidBrightness(let id): return "invalid brightness for displayID=\(id)"
         case .appNotRunning(let app):
             return "BetterDisplay.app is not running (\(app)); betterdisplaycli answers nothing without it"
+        case .proRequired: return "BetterDisplay Pro is required to disconnect external displays"
+        case .invalidValue(let feature): return "betterdisplaycli returned an invalid value for \(feature)"
         }
     }
 }
@@ -65,16 +70,41 @@ public struct BetterDisplayClient: Sendable {
     public let launchWait: TimeInterval
     /// 真正把 app 拉起来的动作。默认 `open -gj`;测试里换成空操作,免得真去开东西。
     public let launcher: @Sendable (URL) -> Void
+    private let activeDisplayProvider: @Sendable () throws -> [Int]
+    private let builtinDisplayProvider: @Sendable (Int) -> Bool
 
     public static let defaultLauncher: @Sendable (URL) -> Void = { application in
         _ = try? CommandRunner.run(URL(fileURLWithPath: "/usr/bin/open"), arguments: ["-gj", application.path], timeout: 10)
     }
 
+    public static let defaultActiveDisplayProvider: @Sendable () throws -> [Int] = {
+        var count: UInt32 = 0
+        let first = CGGetActiveDisplayList(0, nil, &count)
+        guard first == .success else {
+            throw BetterDisplayError.commandFailed("CGGetActiveDisplayList count failed: \(first.rawValue)")
+        }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        let second = CGGetActiveDisplayList(count, &ids, &count)
+        guard second == .success else {
+            throw BetterDisplayError.commandFailed("CGGetActiveDisplayList failed: \(second.rawValue)")
+        }
+        return ids.prefix(Int(count)).map(Int.init)
+    }
+
+    public static let defaultBuiltinDisplayProvider: @Sendable (Int) -> Bool = {
+        CGDisplayIsBuiltin(CGDirectDisplayID($0)) != 0
+    }
+
     public init(executable: URL? = nil, application: URL? = URL(fileURLWithPath: "/Applications/BetterDisplay.app"),
-                launchWait: TimeInterval = 10, launcher: @escaping @Sendable (URL) -> Void = BetterDisplayClient.defaultLauncher) throws {
+                launchWait: TimeInterval = 10,
+                launcher: @escaping @Sendable (URL) -> Void = BetterDisplayClient.defaultLauncher,
+                activeDisplayProvider: @escaping @Sendable () throws -> [Int] = BetterDisplayClient.defaultActiveDisplayProvider,
+                builtinDisplayProvider: @escaping @Sendable (Int) -> Bool = BetterDisplayClient.defaultBuiltinDisplayProvider) throws {
         self.application = application
         self.launchWait = launchWait
         self.launcher = launcher
+        self.activeDisplayProvider = activeDisplayProvider
+        self.builtinDisplayProvider = builtinDisplayProvider
         if let executable {
             self.executable = executable
             return
@@ -90,6 +120,10 @@ public struct BetterDisplayClient: Sendable {
     }
 
     public func displayIDs() throws -> [Int] {
+        try displays().map(\.displayID)
+    }
+
+    public func displays() throws -> [DisplayIdentity] {
         var result = try checked(["get", "--identifiers"])
         if result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             result = try displayIDsAfterLaunchingApp()
@@ -114,13 +148,102 @@ public struct BetterDisplayClient: Sendable {
         } else {
             throw BetterDisplayError.invalidDisplayList
         }
-        let ids = dictionaries.compactMap { item -> Int? in
-            if let number = item["displayID"] as? NSNumber { return number.intValue }
-            if let string = item["displayID"] as? String { return Int(string) }
-            return nil
+        let displays = dictionaries.compactMap { item -> DisplayIdentity? in
+            let id = (item["displayID"] as? NSNumber)?.intValue
+                ?? (item["displayID"] as? String).flatMap(Int.init)
+            guard let id else { return nil }
+            return DisplayIdentity(displayID: id, uuid: item["UUID"] as? String,
+                isBuiltin: builtinDisplayProvider(id))
         }
-        guard !ids.isEmpty else { throw BetterDisplayError.invalidDisplayList }
-        return Array(Set(ids)).sorted()
+        guard !displays.isEmpty else { throw BetterDisplayError.invalidDisplayList }
+        return displays.sorted { $0.displayID < $1.displayID }
+    }
+
+    public func activeDisplays() throws -> [DisplayIdentity] {
+        let active = Set(try activeDisplayProvider())
+        return try displays().filter { active.contains($0.displayID) }
+    }
+
+    public func proAvailable() throws -> Bool {
+        _ = try displays()
+        let value = try feature("proAvailable")
+        switch value.lowercased() {
+        case "on", "true", "1": return true
+        case "off", "false", "0": return false
+        default: throw BetterDisplayError.invalidValue("proAvailable")
+        }
+    }
+
+    public func feature(_ name: String, uuid: String? = nil) throws -> String {
+        var arguments = ["get"]
+        if let uuid { arguments.append("-UUID=\(uuid)") }
+        arguments.append("-\(name)")
+        let value = try checked(arguments).stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { throw BetterDisplayError.invalidValue(name) }
+        return value
+    }
+
+    public func setFeature(_ name: String, value: String, uuid: String) throws {
+        _ = try checked(["set", "-UUID=\(uuid)", "-\(name)=\(value)"])
+    }
+
+    public func disconnectAllButMain() throws {
+        _ = try checked(["set", "-disconnectAllButMain"])
+    }
+
+    public func connectAllDisplays() throws {
+        _ = try checked(["set", "-connectAllDisplays"])
+    }
+
+    public func waitForActiveDisplays(
+        uuids expected: Set<String>,
+        exact: Bool,
+        timeout: TimeInterval = 15
+    ) throws -> [DisplayIdentity] {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last: [DisplayIdentity] = []
+        repeat {
+            last = try activeDisplays()
+            let actual = Set(last.compactMap(\.uuid))
+            if exact ? actual == expected : expected.isSubset(of: actual) { return last }
+            usleep(250_000)
+        } while Date() < deadline
+        let actual = Set(last.compactMap(\.uuid)).sorted().joined(separator: ",")
+        throw BetterDisplayError.commandFailed("display topology did not settle; active UUIDs: \(actual)")
+    }
+
+    public func waitForConnectionStates(
+        _ expected: [String: Bool],
+        timeout: TimeInterval = 15
+    ) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last: [String: String] = [:]
+        repeat {
+            var matches = true
+            for (uuid, wanted) in expected {
+                let value = try feature("connected", uuid: uuid).lowercased()
+                last[uuid] = value
+                let connected = value == "on" || value == "true" || value == "1"
+                if connected != wanted { matches = false }
+            }
+            if matches { return }
+            usleep(250_000)
+        } while Date() < deadline
+        let summary = last.sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ",")
+        throw BetterDisplayError.commandFailed("display connections did not settle; \(summary)")
+    }
+
+    public func waitForMainDisplay(uuid: String, timeout: TimeInterval = 10) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        var last = ""
+        repeat {
+            last = try feature("main", uuid: uuid).lowercased()
+            if last == "on" || last == "true" || last == "1" { return }
+            usleep(250_000)
+        } while Date() < deadline
+        throw BetterDisplayError.commandFailed(
+            "main display did not settle; \(uuid)=\(last)"
+        )
     }
 
     public func brightness(displayID: Int) throws -> Double {
@@ -133,6 +256,15 @@ public struct BetterDisplayClient: Sendable {
 
     public func setBrightness(displayID: Int, value: Double) throws {
         _ = try checked(["set", "-displayID=\(displayID)", "-brightness=\(value)"])
+    }
+
+    /// BetterDisplay supports combined operations, avoiding a second process for readback.
+    public func setBrightnessAndReadback(displayID: Int, value: Double) throws -> Double {
+        let result = try checked(["set", "get", "-displayID=\(displayID)", "-brightness=\(value)"])
+        guard let readback = Double(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines)), readback.isFinite else {
+            throw BetterDisplayError.invalidBrightness(displayID)
+        }
+        return readback
     }
 
     /// CLI 空回答 = app 不在。装了就 `open -gj` 拉起来,轮询到它开口为止。

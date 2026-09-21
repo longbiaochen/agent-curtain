@@ -4,10 +4,12 @@ import Foundation
 public struct DisplayBrightness: Codable, Equatable, Sendable {
     public let displayID: Int
     public let brightness: Double
+    public let uuid: String?
 
-    public init(displayID: Int, brightness: Double) {
+    public init(displayID: Int, brightness: Double, uuid: String? = nil) {
         self.displayID = displayID
         self.brightness = brightness
+        self.uuid = uuid
     }
 }
 
@@ -52,9 +54,6 @@ public enum BrightnessBackupStore {
 
     public static func relinquish(_ claimed: URL, to original: URL) throws {
         guard FileManager.default.fileExists(atPath: claimed.path) else { return }
-        if FileManager.default.fileExists(atPath: original.path) {
-            try FileManager.default.removeItem(at: original)
-        }
         try FileManager.default.moveItem(at: claimed, to: original)
     }
 }

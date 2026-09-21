@@ -18,7 +18,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         coordinator.onChange = { [weak self] in self?.menuBar?.refresh() }
         installKeyboardMonitors()
         installSignalHandlers()
-        coordinator.prepare { [weak self] in self?.startControlServer() }
+        startControlServer()
+        coordinator.prepare {}
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
@@ -75,6 +76,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard event.modifierFlags.intersection(.deviceIndependentFlagsMask).isSuperset(of: required) else { return }
         if event.keyCode == 37, coordinator.phase == .open {
             coordinator.draw { _ in }
+        } else if event.keyCode == 32, coordinator.phase == .drawing || (coordinator.phase == .open && coordinator.lastError != nil) {
+            coordinator.open { _ in }
         }
     }
 

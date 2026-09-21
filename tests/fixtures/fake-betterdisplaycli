@@ -1,3 +1,20 @@
 #!/bin/zsh
 set -eu
 print -r -- "$*" >> "$CURTAIN_FAKE_BETTERDISPLAY_LOG"
+if [[ "$*" == 'get --identifiers' ]]; then
+  print -r -- '{"displayID":7,"UUID":"fixture-seven"}'
+elif [[ "$*" == 'get -proAvailable' ]]; then
+  print -r -- 'on'
+elif [[ "$*" == 'get -UUID=fixture-seven -main' ]]; then
+  print -r -- 'true'
+elif [[ "$*" == 'get -UUID=fixture-seven -placement' ]]; then
+  print -r -- '0x0'
+elif [[ "$*" == 'get -UUID=fixture-seven -resolution' ]]; then
+  print -r -- '1512x982'
+elif [[ "$*" == 'get -UUID=fixture-seven -rotation' ]]; then
+  print -r -- '0'
+elif [[ "$*" == 'get -UUID=fixture-seven -connected' ]]; then
+  print -r -- 'on'
+elif [[ "$*" == 'set get -displayID=7 -brightness=1.0' ]]; then
+  print -r -- '1.0'
+fi

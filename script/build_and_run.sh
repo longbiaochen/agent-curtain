@@ -7,9 +7,10 @@ BUNDLE_ID="com.longbiaochen.AgentCurtain"
 SIGNING_IDENTITY="${CURTAIN_SIGNING_IDENTITY:-Developer ID Application: LONGBIAO CHEN (HJG65XBC25)}"
 MIN_SYSTEM_VERSION="26.0"
 BUILD_CONFIGURATION="${CURTAIN_BUILD_CONFIGURATION:-release}"
+SWIFTPM_SCRATCH_PATH="${CURTAIN_SWIFTPM_SCRATCH_PATH:-${TMPDIR:-/tmp}/agent-curtain-swiftpm-$(id -u)}"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DIST_DIR="$ROOT_DIR/dist"
+DIST_DIR="${CURTAIN_DIST_DIR:-${TMPDIR:-/tmp}/agent-curtain-dist-$(id -u)}"
 DIST_APP="$DIST_DIR/$APP_NAME.app"
 STAGE_DIR="${TMPDIR:-/tmp}/agent-curtain-build-$(id -u)"
 APP_BUNDLE="$STAGE_DIR/$APP_NAME.app"
@@ -41,9 +42,9 @@ s=socket.socket(socket.AF_UNIX); s.settimeout(30); s.connect(sys.argv[1]); s.sen
 }
 
 stage_bundle() {
-  swift build -c "$BUILD_CONFIGURATION"
+  swift build -c "$BUILD_CONFIGURATION" --scratch-path "$SWIFTPM_SCRATCH_PATH"
   local bin_dir
-  bin_dir="$(swift build -c "$BUILD_CONFIGURATION" --show-bin-path)"
+  bin_dir="$(swift build -c "$BUILD_CONFIGURATION" --scratch-path "$SWIFTPM_SCRATCH_PATH" --show-bin-path)"
 
   rm -rf "$APP_BUNDLE"
   mkdir -p "$APP_MACOS"
@@ -71,6 +72,8 @@ publish_dist_copy() {
   mkdir -p "$DIST_DIR"
   /usr/bin/ditto --norsrc "$APP_BUNDLE" "$DIST_APP"
   /usr/bin/xattr -cr "$DIST_APP" 2>/dev/null || true
+  codesign --verify --deep --strict --verbose=2 "$DIST_APP"
+  echo "signed candidate: $DIST_APP"
 }
 
 sign_bundle() {
@@ -81,7 +84,9 @@ sign_bundle() {
   clean_bundle_metadata
   codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_MACOS/AgentCurtain"
   clean_bundle_metadata
-  codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_MACOS/AgentCurtainRestoreWatchdog"
+  # Keep the crash watchdog under the app's stable code requirement. It restores
+  # display hardware, then relaunches the TCC-authorized main executable for windows.
+  codesign --force --identifier "$BUNDLE_ID" --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_MACOS/AgentCurtainRestoreWatchdog"
   clean_bundle_metadata
   codesign --force --options runtime --timestamp --sign "$SIGNING_IDENTITY" "$APP_BUNDLE"
   clean_bundle_metadata
@@ -176,21 +181,7 @@ install_artifacts() {
   launchctl bootstrap "gui/$(id -u)" "$sentry_plist"
   echo "installed curtain-sentry (launchd, every 5 min)"
 
-  # 两个 app 都进登录项。2026-09-06 机器重启后 BetterDisplay 没回来,
-  # betterdisplaycli 静默失败,curtain on 死在「没有显示器」。app 现在会
-  # 按需拉它,但登录项能省掉那几秒,也让菜单栏图标一开机就在。
-  for app in /Applications/BetterDisplay.app "$INSTALLED_APP"; do
-    [[ -d "$app" ]] || continue
-    name=$(basename "$app" .app)
-    if osascript -e 'tell application "System Events" to get the name of every login item' 2>/dev/null |
-         tr ',' '\n' | sed 's/^ *//' | grep -qx "$name"; then
-      echo "login item already present: $name"
-    elif osascript -e "tell application \"System Events\" to make login item at end with properties {path:\"$app\", hidden:true}" >/dev/null 2>&1; then
-      echo "added login item: $name"
-    else
-      echo "warning: could not add login item for $name (System Events automation permission?)" >&2
-    fi
-  done
+  echo "preserved existing login-item registrations"
 }
 
 stop_running_app
@@ -213,25 +204,40 @@ case "$MODE" in
     /usr/bin/log stream --info --style compact --predicate 'subsystem == "com.longbiaochen.AgentCurtain" OR process == "AgentCurtain"'
     ;;
   --verify|verify)
-    swift test
+    swift test --scratch-path "$SWIFTPM_SCRATCH_PATH"
     "$ROOT_DIR/tests/banner-lifetime.zsh"
-    "$ROOT_DIR/tests/watchdog-integration.zsh"
+    zsh "$ROOT_DIR/tests/banner-layout.zsh"
+    zsh "$ROOT_DIR/tests/coordinator-transitions.zsh"
+    CURTAIN_SWIFTPM_SCRATCH_PATH="$SWIFTPM_SCRATCH_PATH" "$ROOT_DIR/tests/watchdog-integration.zsh"
     swiftc -typecheck -parse-as-library "$ROOT_DIR/script/verify_banner_framebuffer.swift" \
       -framework CoreGraphics \
       -framework ScreenCaptureKit
     launch_and_wait "$APP_BUNDLE"
-    python3 -c 'import json,os,socket,stat,sys
+    python3 -c 'import json,os,socket,stat,sys,time
 path=sys.argv[1]
 mode=stat.S_IMODE(os.stat(path).st_mode)
 assert mode == 0o600, oct(mode)
-s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(path); s.sendall(b"status\n"); s.shutdown(socket.SHUT_WR)
-response=json.loads(s.recv(4096)); assert response["ok"] is True; assert response["state"] == "open", response
+deadline=time.time()+60
+while True:
+ s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(path); s.sendall(b"status\n"); s.shutdown(socket.SHUT_WR)
+ response=json.loads(s.recv(4096)); s.close()
+ if response.get("state") == "open": break
+ if time.time() >= deadline: raise AssertionError(response)
+ time.sleep(.25)
+assert response["ok"] is True, response
 print("verify: signed app launched; control.sock is 0600; status protocol returned open")' "$SOCKET_PATH"
     ;;
   --install|install)
     install_artifacts
-    python3 -c 'import json,socket,sys
-s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1]); s.sendall(b"status\n"); s.shutdown(socket.SHUT_WR)
-r=json.loads(s.recv(4096)); assert r["ok"] is True; print("installed status:", json.dumps(r, ensure_ascii=False, sort_keys=True))' "$SOCKET_PATH"
+    python3 -c 'import json,socket,sys,time
+deadline=time.time()+60
+while True:
+ s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1]); s.sendall(b"status\n"); s.shutdown(socket.SHUT_WR)
+ r=json.loads(s.recv(4096)); s.close()
+ if r.get("state") == "open": break
+ if time.time() >= deadline: raise AssertionError(r)
+ time.sleep(.25)
+assert r["ok"] is True, r
+print("installed status:", json.dumps(r, ensure_ascii=False, sort_keys=True))' "$SOCKET_PATH"
     ;;
 esac

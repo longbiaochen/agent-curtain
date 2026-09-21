@@ -13,6 +13,10 @@ public struct CurtainPaths: Sendable {
     public var denylist: URL { configDirectory.appendingPathComponent("denylist") }
     public var controlSocket: URL { stateDirectory.appendingPathComponent("control.sock") }
     public var brightnessBackup: URL { stateDirectory.appendingPathComponent("brightness.json") }
+    public var displaySessionBackup: URL { stateDirectory.appendingPathComponent("display-session.json") }
+    public var windowSessionBackup: URL { stateDirectory.appendingPathComponent("window-session.json") }
+    public var watchdogLog: URL { stateDirectory.appendingPathComponent("watchdog.log") }
+    public var recoveryLock: URL { stateDirectory.appendingPathComponent("recovery.lock") }
     /// 见 CurtainExpectation —— 外部看护靠它判断幕帘是不是掉了。
     public var expectation: URL { stateDirectory.appendingPathComponent("expected") }
 

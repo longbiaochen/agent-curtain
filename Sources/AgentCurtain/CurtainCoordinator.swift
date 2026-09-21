@@ -14,21 +14,29 @@ final class CurtainCoordinator {
     private let blocker = InputBlocker()
     private let banners = BannerController()
     private let brightness: BrightnessController
+    private let displaySession: DisplaySessionController
+    private let windowSession: WindowSessionController
     private let expectation: CurtainExpectation
     private let worker = DispatchQueue(label: "com.longbiaochen.AgentCurtain.operations")
     private var configuration = CurtainConfiguration(allowedRules: [], deniedRules: [])
     private var autoOpenTimer: Timer?
+    private var drawCancellation: CurtainCancellation?
+    private var screenReconcileWorkItem: DispatchWorkItem?
+    private var screenReconcileCancellation: CurtainCancellation?
     private var pendingOpenCompletions: [(ControlResponse) -> Void] = []
 
     private(set) var phase: Phase = .starting
     private(set) var since: Date?
     private(set) var displayCount = 0
+    private(set) var activeDisplayCount = 0
     private(set) var lastError: String?
     var onChange: (() -> Void)?
 
     init(paths: CurtainPaths) {
         self.paths = paths
         brightness = BrightnessController(paths: paths)
+        displaySession = DisplaySessionController(paths: paths)
+        windowSession = WindowSessionController(paths: paths)
         expectation = CurtainExpectation(paths: paths)
         blocker.onReleaseHotkey = { [weak self] in self?.open(completion: { _ in }) }
         banners.onScreensChanged = { [weak self] in self?.screensChanged() }
@@ -37,23 +45,33 @@ final class CurtainCoordinator {
     func prepare(completion: @escaping () -> Void) {
         worker.async { [weak self] in
             guard let self else { return }
+            var nextConfiguration: CurtainConfiguration?
+            var messages: [String] = []
+            do { nextConfiguration = try CurtainConfiguration.load(from: self.paths) }
+            catch { messages.append("configuration: \(error.localizedDescription)") }
+
             do {
-                let config = try CurtainConfiguration.load(from: self.paths)
-                try self.brightness.recoverStaleBackup()
-                DispatchQueue.main.async {
-                    self.configuration = config
-                    self.phase = .open
-                    self.lastError = nil
-                    self.changed()
-                    completion()
+                let recoveryLock = try RecoveryTransactionLock(url: self.paths.recoveryLock)
+                let restoration = withExtendedLifetime(recoveryLock) {
+                    self.restoreProtectionStateLocked()
                 }
-            } catch {
-                DispatchQueue.main.async {
-                    self.phase = .open
-                    self.lastError = "startup recovery failed: \(error.localizedDescription)"
-                    self.changed()
-                    completion()
-                }
+                if let error = restoration.error { messages.append(error.localizedDescription) }
+            } catch { messages.append("recovery lock: \(error.localizedDescription)") }
+
+            self.displaySession.refreshBackendDiagnostics()
+            var activeDisplayCount: Int?
+            do { activeDisplayCount = try self.displaySession.currentActiveDisplayCount() }
+            catch { messages.append("active displays: \(error.localizedDescription)") }
+
+            DispatchQueue.main.async {
+                if let nextConfiguration { self.configuration = nextConfiguration }
+                if let activeDisplayCount { self.activeDisplayCount = activeDisplayCount }
+                self.phase = .open
+                self.lastError = messages.isEmpty
+                    ? nil
+                    : "startup recovery failed: \(messages.joined(separator: "; "))"
+                self.changed()
+                completion()
             }
         }
     }
@@ -65,7 +83,7 @@ final class CurtainCoordinator {
         case .open:
             open(completion: completion)
         case .status:
-            completion(response(ok: true))
+            completion(response(ok: lastError == nil))
         case .reload:
             reload(completion: completion)
         case .quit:
@@ -100,13 +118,21 @@ final class CurtainCoordinator {
 
         phase = .drawing
         lastError = nil
+        let cancellation = CurtainCancellation()
+        drawCancellation = cancellation
+        banners.show(.enabling)
         changed()
         worker.async { [weak self] in
             guard let self else { return }
             do {
-                let count = try self.brightness.dimAllDisplays()
+                let count = try self.displaySession.capture()
+                _ = try self.windowSession.capture()
+                _ = try self.brightness.dimAllDisplays(
+                    displaySessionBackup: self.paths.displaySessionBackup,
+                    isCancelled: { cancellation.isCancelled }
+                )
                 DispatchQueue.main.async {
-                    guard self.phase == .drawing else {
+                    guard self.phase == .drawing, self.drawCancellation === cancellation else {
                         completion(ControlResponse(ok: false, state: self.phase.rawValue, error: "draw was cancelled"))
                         return
                     }
@@ -115,39 +141,42 @@ final class CurtainCoordinator {
                             configuration: self.configuration,
                             allowAnyInjected: allowAnyInjected
                         )
-                        self.banners.show()
-                        self.displayCount = count
-                        self.since = Date()
-                        self.phase = .drawn
-                        // 落盘,好让 curtain-sentry 在本进程消失后仍知道
-                        // 「幕帘本该是拉上的」。写失败不影响拉幕帘本身。
-                        try? self.expectation.record()
-                        self.scheduleAutomaticOpen(after: duration)
-                        self.changed()
-                        completion(self.response(ok: true))
-                    } catch {
-                        self.phase = .opening
-                        self.lastError = error.localizedDescription
-                        self.changed()
                         self.worker.async {
-                            let restoreError = Result { try self.brightness.restoreAllDisplays() }.failure
-                            DispatchQueue.main.async {
-                                self.phase = .open
-                                self.displayCount = 0
-                                self.changed()
-                                let message = [error.localizedDescription, restoreError?.localizedDescription]
-                                    .compactMap { $0 }.joined(separator: "; ")
-                                completion(ControlResponse(ok: false, state: "open", error: message))
+                            do {
+                                _ = try self.displaySession.disconnectExternalDisplays(
+                                    isCancelled: { cancellation.isCancelled }
+                                )
+                                DispatchQueue.main.async {
+                                    guard self.phase == .drawing,
+                                          self.drawCancellation === cancellation else {
+                                        completion(ControlResponse(ok: false, state: self.phase.rawValue,
+                                            error: "draw was cancelled"))
+                                        return
+                                    }
+                                    self.banners.show(.protected)
+                                    self.displayCount = count
+                                    self.activeDisplayCount = 1
+                                    self.since = Date()
+                                    self.phase = .drawn
+                                    self.drawCancellation = nil
+                                    try? self.expectation.record()
+                                    self.scheduleAutomaticOpen(after: duration)
+                                    self.changed()
+                                    completion(self.response(ok: true))
+                                }
+                            } catch {
+                                DispatchQueue.main.async {
+                                    self.failDrawing(error, completion: completion)
+                                }
                             }
                         }
+                    } catch {
+                        self.failDrawing(error, completion: completion)
                     }
                 }
             } catch {
                 DispatchQueue.main.async {
-                    if self.phase == .drawing { self.phase = .open }
-                    self.lastError = error.localizedDescription
-                    self.changed()
-                    completion(ControlResponse(ok: false, state: self.phase.rawValue, error: error.localizedDescription))
+                    self.failDrawing(error, completion: completion)
                 }
             }
         }
@@ -155,7 +184,7 @@ final class CurtainCoordinator {
 
     func open(completion: @escaping (ControlResponse) -> Void) {
         precondition(Thread.isMainThread)
-        if phase == .open {
+        if phase == .open && lastError == nil {
             completion(response(ok: true))
             return
         }
@@ -167,29 +196,118 @@ final class CurtainCoordinator {
         if phase == .opening { return }
 
         phase = .opening
+        drawCancellation?.cancel()
+        drawCancellation = nil
+        screenReconcileWorkItem?.cancel()
+        screenReconcileWorkItem = nil
+        screenReconcileCancellation?.cancel()
+        screenReconcileCancellation = nil
+        banners.show(.disabling)
         // 主动拉开才清除意图。崩溃、被卸载、被替换都到不了这里 ——
         // 那正是看护要认出来的情况。
         try? expectation.clear()
         autoOpenTimer?.invalidate()
         autoOpenTimer = nil
         blocker.stop()
-        banners.hide()
         changed()
         worker.async { [weak self] in
             guard let self else { return }
-            let restoreError = Result { try self.brightness.restoreAllDisplays() }.failure
+            let restoration = self.restoreProtectionState()
             DispatchQueue.main.async {
-                self.phase = .open
-                self.since = nil
-                self.displayCount = 0
-                self.lastError = restoreError?.localizedDescription
-                self.changed()
-                let response = self.response(ok: restoreError == nil)
-                let callbacks = self.pendingOpenCompletions
-                self.pendingOpenCompletions.removeAll()
-                callbacks.forEach { $0(response) }
+                self.finishOpening(
+                    restoreError: restoration.error,
+                    restoredActiveDisplayCount: restoration.activeDisplayCount
+                )
             }
         }
+    }
+
+    private func failDrawing(_ error: Error, completion: @escaping (ControlResponse) -> Void) {
+        guard phase == .drawing else {
+            completion(ControlResponse(ok: false, state: phase.rawValue, error: error.localizedDescription))
+            return
+        }
+        phase = .opening
+        drawCancellation?.cancel()
+        drawCancellation = nil
+        blocker.stop()
+        lastError = error.localizedDescription
+        banners.show(.disabling)
+        changed()
+        worker.async { [weak self] in
+            guard let self else { return }
+            let restoration = self.restoreProtectionState()
+            DispatchQueue.main.async {
+                self.finishOpening(
+                    restoreError: restoration.error,
+                    operationError: error,
+                    restoredActiveDisplayCount: restoration.activeDisplayCount
+                )
+                completion(ControlResponse(ok: false, state: "open", error: self.lastError))
+            }
+        }
+    }
+
+    private func restoreProtectionState() -> (error: Error?, activeDisplayCount: Int?) {
+        do {
+            let recoveryLock = try RecoveryTransactionLock(url: paths.recoveryLock)
+            return withExtendedLifetime(recoveryLock) { restoreProtectionStateLocked() }
+        } catch {
+            return (error, nil)
+        }
+    }
+
+    private func restoreProtectionStateLocked() -> (error: Error?, activeDisplayCount: Int?) {
+        var messages: [String] = []
+        let pendingExternalDisplays = displaySession.pendingRestoreCount
+        var displaysRestored = true
+        do { try displaySession.restoreAllDisplays() }
+        catch {
+            displaysRestored = false
+            messages.append("display restore: \(error.localizedDescription)")
+        }
+        do { try brightness.restoreAllDisplays() }
+        catch { messages.append("brightness restore: \(error.localizedDescription)") }
+        if displaysRestored {
+            do { _ = try windowSession.restoreAllWindows() }
+            catch { messages.append("window restore: \(error.localizedDescription)") }
+        }
+        return (
+            messages.isEmpty ? nil : CurtainRecoveryError(messages: messages),
+            pendingExternalDisplays > 0 ? pendingExternalDisplays + 1 : nil
+        )
+    }
+
+    private func finishOpening(
+        restoreError: Error?,
+        operationError: Error? = nil,
+        restoredActiveDisplayCount: Int? = nil
+    ) {
+        let restoredDisplayCount = displayCount
+        phase = .open
+        since = nil
+        displayCount = 0
+        if restoreError == nil {
+            if let restoredActiveDisplayCount {
+                activeDisplayCount = restoredActiveDisplayCount
+            } else if restoredDisplayCount > 0 {
+                activeDisplayCount = restoredDisplayCount
+            }
+        }
+        drawCancellation = nil
+        let errors = [operationError?.localizedDescription, restoreError?.localizedDescription].compactMap { $0 }
+        lastError = errors.isEmpty ? nil : errors.joined(separator: "; ")
+        if lastError == nil {
+            banners.finishRelease()
+        } else {
+            banners.show(.failed)
+        }
+        changed()
+        // A release/quit can arrive during rollback as well as normal opening.
+        let response = response(ok: restoreError == nil)
+        let callbacks = pendingOpenCompletions
+        pendingOpenCompletions.removeAll()
+        callbacks.forEach { $0(response) }
     }
 
     func reload(completion: @escaping (ControlResponse) -> Void) {
@@ -216,10 +334,20 @@ final class CurtainCoordinator {
     func response(ok: Bool) -> ControlResponse {
         let counters = blocker.counters()
         let stableState = phase == .drawn ? "drawn" : (phase == .open ? "open" : phase.rawValue)
+        let restorePending = displaySession.pendingRestoreCount
         return ControlResponse(
             ok: ok,
             state: stableState,
             displays: displayCount,
+            activeDisplays: activeDisplayCount,
+            displayMode: phase == .drawn ? "internal-only" : (restorePending > 0 ? "restore-pending" : "all-displays"),
+            restorePending: restorePending,
+            windowRestorePending: windowSession.pendingRestoreCount,
+            windows: windowSession.lastCapturedCount,
+            restoredWindows: windowSession.lastRestoredCount,
+            displayBackend: displaySession.displayBackendStatus,
+            betterDisplayPro: displaySession.betterDisplayProStatus,
+            privateDisplaySPI: displaySession.privateDisplaySPIStatus,
             blocked: counters.blocked,
             allowed: counters.allowed,
             denied: counters.deniedPIDs,
@@ -232,12 +360,12 @@ final class CurtainCoordinator {
         let counters = blocker.counters()
         switch phase {
         case .drawn:
-            return "幕帘已拉上 · 阻断 \(counters.blocked) · 放行 \(counters.allowed)"
+            return "屏幕关闭·输入锁定 · 仅内屏 · 阻断 \(counters.blocked) · 放行 \(counters.allowed)"
         case .open:
-            return lastError.map { "幕帘已拉开 · \($0)" } ?? "幕帘已拉开"
+            return lastError.map { "操作未完成 · \($0)" } ?? "已解除保护"
         case .starting: return "正在启动…"
-        case .drawing: return "正在拉上幕帘…"
-        case .opening: return "正在拉开幕帘…"
+        case .drawing: return "启用保护中…"
+        case .opening: return "解除保护中…"
         }
     }
 
@@ -251,26 +379,61 @@ final class CurtainCoordinator {
 
     private func screensChanged() {
         guard phase == .drawn else { return }
-        worker.async { [weak self] in
+        screenReconcileWorkItem?.cancel()
+        screenReconcileCancellation?.cancel()
+        let cancellation = CurtainCancellation()
+        screenReconcileCancellation = cancellation
+        let item = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            do {
-                let count = try self.brightness.dimNewDisplays()
-                DispatchQueue.main.async {
-                    guard self.phase == .drawn else { return }
-                    self.displayCount = count
-                    self.changed()
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.lastError = "display reconciliation failed: \(error.localizedDescription)"
-                    self.changed()
+            self.worker.async {
+                guard !cancellation.isCancelled else { return }
+                do {
+                    let count = try self.brightness.dimNewDisplays()
+                    guard !cancellation.isCancelled else { return }
+                    let managedCount = try self.displaySession.reconcileNewDisplays()
+                    DispatchQueue.main.async {
+                        guard self.phase == .drawn, !cancellation.isCancelled else { return }
+                        self.displayCount = max(count, managedCount)
+                        self.activeDisplayCount = 1
+                        self.changed()
+                    }
+                } catch {
+                    DispatchQueue.main.async {
+                        guard !cancellation.isCancelled else { return }
+                        self.lastError = "display reconciliation failed: \(error.localizedDescription)"
+                        self.changed()
+                    }
                 }
             }
         }
+        screenReconcileWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: item)
     }
 
     private func changed() {
         onChange?()
+    }
+}
+
+private struct CurtainRecoveryError: Error, LocalizedError {
+    let messages: [String]
+    var errorDescription: String? { messages.joined(separator: "; ") }
+}
+
+private final class CurtainCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
     }
 }
 
