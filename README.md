@@ -12,6 +12,8 @@ work.
 [Implementation PRD](docs/PRD-menubar-app.md) ·
 [Acceptance matrix](docs/ACCEPTANCE-menubar-app.md)
 
+**Current release: [v1.1.0](docs/RELEASE-v1.1.0.md)** · Apple Silicon · macOS 26+
+
 > AgentCurtain is weaker than the real lock screen. It deters opportunistic
 > access; it does not protect against a prepared attacker, a reboot, new input
 > hardware, or physical access to storage. The UI deliberately says “curtain”
@@ -34,6 +36,19 @@ component that needs Accessibility permission. It contains:
 The `curtain` command is a thin, unprivileged socket client. It never creates an
 event tap and therefore needs no TCC permission.
 
+## One-screen remote mode
+
+Multi-display Macs are awkward to control from an iPad: the remote client has to
+switch between several desktops while windows remain scattered across them.
+AgentCurtain v1.1 disconnects every external display from the active topology
+while protection is enabled. macOS moves those windows onto the built-in display,
+so remote-desktop software sees one working screen.
+
+Opening the curtain reconnects the displays and restores surviving windows to
+their original display and frame. Display UUIDs are used as stable identities,
+including after a display receives a new runtime ID. The embedded watchdog runs
+the same recovery after an unexpected app exit.
+
 ## Install
 
 Requirements:
@@ -44,6 +59,8 @@ Requirements:
 - the Developer ID identity named in the PRD when building from source.
 
 ```bash
+git clone https://github.com/longbiaochen/agent-curtain.git
+cd agent-curtain
 ./install.sh
 ```
 

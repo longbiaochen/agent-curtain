@@ -10,6 +10,8 @@ AgentCurtain 是面向 macOS 26+ 无人值守 GUI agent 会话的菜单栏应用
 [实现 PRD](docs/PRD-menubar-app.md) ·
 [验收矩阵](docs/ACCEPTANCE-menubar-app.md)
 
+**当前版本：[v1.1.0](docs/RELEASE-v1.1.0.md)** · Apple Silicon · macOS 26+
+
 > AgentCurtain 弱于真锁屏。它防的是路过同事、进屋访客等机会型接触，防不住
 > 有准备的攻击者、重启、插入新输入设备或物理拆机。“屏幕关闭·输入锁定”表示
 > 屏幕亮度归零并启用输入拦截，不等同于 macOS 系统锁屏。
@@ -31,6 +33,16 @@ AgentCurtain 是面向 macOS 26+ 无人值守 GUI agent 会话的菜单栏应用
 `curtain` 是不持有权限的瘦 socket 客户端。它不会创建事件 tap，因此不需要任何
 TCC 授权。
 
+## iPad 远程时只留一个屏幕
+
+多屏 Mac 用 iPad 远程控制时很麻烦：远程端要来回切换几个桌面，窗口还散落在不同
+屏幕。AgentCurtain v1.1 启用保护后，会把全部外接显示器从活动显示拓扑中断开。
+macOS 随即把外屏窗口收回内屏，UU Remote 等远程桌面只需显示和操作一个屏幕。
+
+解除保护后，外屏会重新连接，仍然存在的窗口按原显示器和原位置恢复。恢复过程用显示
+UUID 识别设备，即使系统重新分配了临时 Display ID 也能对应；主程序意外退出时，包内
+看门狗也会执行同一套恢复流程。
+
 ## 安装
 
 依赖：
@@ -41,6 +53,8 @@ TCC 授权。
 - 从源码构建时，钥匙串内有 PRD 指定的 Developer ID 身份。
 
 ```bash
+git clone https://github.com/longbiaochen/agent-curtain.git
+cd agent-curtain
 ./install.sh
 ```
 
